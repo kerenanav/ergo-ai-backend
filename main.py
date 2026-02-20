@@ -216,10 +216,10 @@ class PredictResponse(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    bookings: list[BookingFeatures] = Field(..., min_length=1)
-    capacity: float            = Field(default=100.0, ge=1, description="Hotel capacity (rooms)")
-    cancellation_penalty: float = Field(default=50.0, ge=0, description="Penalty per cancellation (€)")
-    lambda_overbooking: float  = Field(default=1.0,  ge=0, description="Overbooking multiplier")
+    cancellation_penalty: float = 50.0
+    capacity: float             = 100.0
+    lambda_risk: float          = 1.0
+    n_bookings: int             = 5
 
 
 class OptimizeResponse(BaseModel):
@@ -355,20 +355,25 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     """
     _require_ready()
 
+    print(f"PARAMETRI RICEVUTI: {request}", flush=True)
+    logger.info(
+        "/optimize called — capacity=%.0f  penalty=%.2f  lambda=%.2f  n_bookings=%d",
+        request.capacity, request.cancellation_penalty,
+        request.lambda_risk, request.n_bookings,
+    )
+
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
+    df_full:   pd.DataFrame          = _state["df"]
 
-    logger.info(
-        "/optimize called — capacity=%.0f  penalty=%.2f  lambda=%.2f  bookings=%d",
-        request.capacity, request.cancellation_penalty,
-        request.lambda_overbooking, len(request.bookings),
-    )
-    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_overbooking={request.lambda_overbooking}, n_bookings={len(request.bookings)}", flush=True)
-
-    df = _bookings_to_df(request.bookings)
+    # Sample n_bookings from the already-loaded dataset
+    n = min(request.n_bookings, len(df_full))
+    rng = np.random.default_rng(RANDOM_SEED)
+    idx = rng.choice(len(df_full), size=n, replace=False)
+    df = df_full.iloc[idx].copy().reset_index(drop=True)
 
     try:
-        p_cancel = predictor.predict_from_raw(df)
+        p_cancel = predictor.predict_proba(df)
     except Exception as exc:
         logger.exception("Prediction step failed inside /optimize")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -376,7 +381,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     params = OptimizationParams(
         capacity=request.capacity,
         cancellation_penalty=request.cancellation_penalty,
-        lambda_overbooking=request.lambda_overbooking,
+        lambda_overbooking=request.lambda_risk,
     )
 
     try:
@@ -395,7 +400,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     }
 
     return OptimizeResponse(
-        n_bookings=len(request.bookings),
+        n_bookings=n,
         n_accepted=result.n_accepted,
         n_rejected=result.n_rejected,
         total_expected_revenue=round(result.total_expected_revenue, 2),
@@ -404,7 +409,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         params_used={
             "capacity":             request.capacity,
             "cancellation_penalty": request.cancellation_penalty,
-            "lambda_overbooking":   request.lambda_overbooking,
+            "lambda_risk":          request.lambda_risk,
         },
         decisions=_opt_result_to_dict(result),
     )
@@ -482,6 +487,12 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
     - ``lambda_sensitivity``    : lambda 0.0 → 3.0
     """
     _require_ready()
+
+    print(f"PARAMETRI RICEVUTI: {request}", flush=True)
+    logger.info(
+        "/sensitivity called — capacity=%.0f  base_penalty=%.2f  base_lambda=%.2f  n_sample=%d",
+        request.capacity, request.base_penalty, request.base_lambda, request.n_sample,
+    )
 
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
