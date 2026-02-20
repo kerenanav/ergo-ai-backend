@@ -403,10 +403,10 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         logger.exception("Optimisation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # Realized profit using actual is_canceled outcomes
+    # ── Realized profit using actual is_canceled outcomes ──────────────────
     adr_arr = df["adr"].fillna(0).values.astype(np.float64)
     if "total_nights" in df.columns:
-        nights_arr = df["total_nights"].fillna(1).values.astype(np.float64)
+        nights_arr = df["total_nights"].fillna(0).values.astype(np.float64)
     elif "stays_in_week_nights" in df.columns:
         nights_arr = (
             df["stays_in_weekend_nights"].fillna(0)
@@ -423,6 +423,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         else np.zeros(len(df), dtype=int)
     )
 
+    # AI realized profit: only accepted bookings count
     total_realized_profit = 0.0
     for i, dec in enumerate(result.decisions):
         if dec == 1:
@@ -430,6 +431,27 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
                 total_realized_profit += float(gross_rev_arr[i])
             else:
                 total_realized_profit -= request.cancellation_penalty
+
+    # Baseline realized profit: accept-all on same sample
+    baseline_realized_profit = 0.0
+    for i in range(len(df)):
+        if y_true_arr[i] == 0:
+            baseline_realized_profit += float(gross_rev_arr[i])
+        else:
+            baseline_realized_profit -= request.cancellation_penalty
+
+    diff = total_realized_profit - baseline_realized_profit
+    print(
+        f"\n[AI vs Baseline — same {len(df)} bookings]\n"
+        f"  AI       : accepted={result.n_accepted:>4}/{len(df)}  "
+        f"realized_profit={total_realized_profit:>10,.2f}\n"
+        f"  Baseline : accepted={len(df):>4}/{len(df)}  "
+        f"realized_profit={baseline_realized_profit:>10,.2f}\n"
+        f"  Diff     : {diff:>+10,.2f}  "
+        f"({'AI wins' if diff >= 0 else 'Baseline wins'})\n"
+        f"  [actual cancellations in sample: {int(y_true_arr.sum())}/{len(df)}]",
+        flush=True,
+    )
 
     # Cache for report
     _state["last_optimize"] = {
@@ -525,19 +547,19 @@ async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, A
     idx = rng.choice(len(df_full), size=n, replace=False)
     df = df_full.iloc[idx].copy().reset_index(drop=True)
 
-    # Predict P(cancel) for expected-value stats
-    p_cancel = predictor.predict_proba(df)
-
-    # Gross revenue: adr × (weekend + week nights)
-    adr = df["adr"].fillna(0).values
-    weekend = df["stays_in_weekend_nights"].fillna(0).values
-    weekday = df["stays_in_week_nights"].fillna(0).values
-    nights = np.maximum(weekend + weekday, 1.0)
+    # Gross revenue — same logic as /optimize for consistency
+    adr = df["adr"].fillna(0).values.astype(np.float64)
+    if "total_nights" in df.columns:
+        nights = df["total_nights"].fillna(0).values.astype(np.float64)
+    elif "stays_in_week_nights" in df.columns:
+        nights = (
+            df["stays_in_weekend_nights"].fillna(0)
+            + df["stays_in_week_nights"].fillna(0)
+        ).values.astype(np.float64)
+    else:
+        nights = np.ones(n, dtype=np.float64)
+    nights = np.maximum(nights, 1.0)
     gross_rev = adr * nights
-
-    # Expected value per booking (accept-all, no optimisation)
-    p_no_cancel = 1.0 - p_cancel
-    ev_per_booking = p_no_cancel * gross_rev - p_cancel * request.cancellation_penalty
 
     # Realised outcome using actual is_canceled
     y_true = (
@@ -547,6 +569,7 @@ async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, A
     )
     realized_cancellations = int(y_true.sum())
 
+    # Baseline: accept ALL n bookings
     realized_profit = 0.0
     for i in range(n):
         if y_true[i] == 0:
@@ -554,11 +577,20 @@ async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, A
         else:
             realized_profit -= request.cancellation_penalty
 
+    print(
+        f"\n[historical_baseline — {n} bookings, all accepted]\n"
+        f"  cancellations : {realized_cancellations}/{n}\n"
+        f"  gross_revenue : {float(gross_rev.sum()):>10,.2f}\n"
+        f"  realized_profit: {realized_profit:>10,.2f}  "
+        f"(losses from cancellations: {realized_cancellations} × {request.cancellation_penalty} "
+        f"= {realized_cancellations * request.cancellation_penalty:,.2f})",
+        flush=True,
+    )
+
     return {
         "bookings_accepted":         n,
         "total_realized_profit":     round(realized_profit, 2),
         "total_gross_revenue":       round(float(gross_rev.sum()), 2),
-        "avg_cancellation_risk":     round(float(p_cancel.mean()), 4),
         "realized_cancellations":    realized_cancellations,
         "cancellation_penalty_used": request.cancellation_penalty,
     }
