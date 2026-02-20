@@ -229,6 +229,7 @@ class OptimizeResponse(BaseModel):
     total_expected_revenue: float
     expected_occupancy: float
     solver_status: str
+    params_used: dict[str, float]
     decisions: list[dict[str, Any]]
 
 
@@ -357,6 +358,12 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
 
+    logger.info(
+        "/optimize called — capacity=%.0f  penalty=%.2f  lambda=%.2f  bookings=%d",
+        request.capacity, request.cancellation_penalty,
+        request.lambda_overbooking, len(request.bookings),
+    )
+
     df = _bookings_to_df(request.bookings)
 
     try:
@@ -393,6 +400,11 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         total_expected_revenue=round(result.total_expected_revenue, 2),
         expected_occupancy=round(result.expected_occupancy, 2),
         solver_status=result.solver_status,
+        params_used={
+            "capacity":             request.capacity,
+            "cancellation_penalty": request.cancellation_penalty,
+            "lambda_overbooking":   request.lambda_overbooking,
+        },
         decisions=_opt_result_to_dict(result),
     )
 
