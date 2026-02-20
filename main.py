@@ -216,7 +216,7 @@ class PredictResponse(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    bookings: list[BookingFeatures] = Field(..., min_length=1)
+    bookings: list[BookingFeatures] = Field(default=[], description="Ignored: dataset sample is used instead")
     cancellation_penalty: float     = 50.0
     capacity: float                 = 100.0
     lambda_risk: float              = 1.0
@@ -355,20 +355,24 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     """
     _require_ready()
 
-    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}, n_bookings={len(request.bookings)}", flush=True)
+    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}", flush=True)
     logger.info(
-        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f  bookings=%d",
-        request.capacity, request.cancellation_penalty,
-        request.lambda_risk, len(request.bookings),
+        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f",
+        request.capacity, request.cancellation_penalty, request.lambda_risk,
     )
 
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
+    df_full:   pd.DataFrame          = _state["df"]
 
-    df = _bookings_to_df(request.bookings)
+    # Sample 20 real bookings from the loaded dataset (bookings from frontend are ignored)
+    n_sample = 20
+    rng = np.random.default_rng(RANDOM_SEED)
+    idx = rng.choice(len(df_full), size=min(n_sample, len(df_full)), replace=False)
+    df = df_full.iloc[idx].copy().reset_index(drop=True)
 
     try:
-        p_cancel = predictor.predict_from_raw(df)
+        p_cancel = predictor.predict_proba(df)
     except Exception as exc:
         logger.exception("Prediction step failed inside /optimize")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -395,7 +399,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     }
 
     return OptimizeResponse(
-        n_bookings=len(request.bookings),
+        n_bookings=len(df),
         n_accepted=result.n_accepted,
         n_rejected=result.n_rejected,
         total_expected_revenue=round(result.total_expected_revenue, 2),
