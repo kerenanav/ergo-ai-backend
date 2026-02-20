@@ -228,6 +228,7 @@ class OptimizeResponse(BaseModel):
     n_accepted: int
     n_rejected: int
     total_expected_revenue: float
+    total_realized_profit: float
     expected_occupancy: float
     solver_status: str
     params_used: dict[str, float]
@@ -269,23 +270,34 @@ def _bookings_to_df(bookings: list[BookingFeatures]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _opt_result_to_dict(result: OptimizationResult) -> list[dict[str, Any]]:
-    return [
-        {
-            "booking_id":     i,
-            "accept":         bool(result.decisions[i]),
-            "p_cancel":       round(float(result.p_cancel[i]), 4),
-            "p_no_cancel":    round(float(1.0 - result.p_cancel[i]), 4),
-            "expected_value": round(float(result.expected_values[i]), 2),
-            "gross_revenue":  round(float(result.gross_revenues[i]), 2),
-            "risk_label":     (
+def _opt_result_to_dict(
+    result: OptimizationResult,
+    y_true: np.ndarray | None = None,
+    gross_rev: np.ndarray | None = None,
+    penalty: float = 0.0,
+) -> list[dict[str, Any]]:
+    rows = []
+    for i in range(len(result.decisions)):
+        accepted = bool(result.decisions[i])
+        if y_true is not None and gross_rev is not None and accepted:
+            realized = float(gross_rev[i]) if y_true[i] == 0 else -penalty
+        else:
+            realized = 0.0
+        rows.append({
+            "booking_id":       i,
+            "accept":           accepted,
+            "p_cancel":         round(float(result.p_cancel[i]), 4),
+            "p_no_cancel":      round(float(1.0 - result.p_cancel[i]), 4),
+            "expected_value":   round(float(result.expected_values[i]), 2),
+            "gross_revenue":    round(float(result.gross_revenues[i]), 2),
+            "realized_profit":  round(realized, 2),
+            "risk_label":       (
                 "high"   if result.p_cancel[i] > 0.60
                 else "medium" if result.p_cancel[i] > 0.35
                 else "low"
             ),
-        }
-        for i in range(len(result.decisions))
-    ]
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +403,34 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         logger.exception("Optimisation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    # Realized profit using actual is_canceled outcomes
+    adr_arr = df["adr"].fillna(0).values.astype(np.float64)
+    if "total_nights" in df.columns:
+        nights_arr = df["total_nights"].fillna(1).values.astype(np.float64)
+    elif "stays_in_week_nights" in df.columns:
+        nights_arr = (
+            df["stays_in_weekend_nights"].fillna(0)
+            + df["stays_in_week_nights"].fillna(0)
+        ).values.astype(np.float64)
+    else:
+        nights_arr = np.ones(len(df), dtype=np.float64)
+    nights_arr = np.maximum(nights_arr, 1.0)
+    gross_rev_arr = adr_arr * nights_arr
+
+    y_true_arr = (
+        df["is_canceled"].values.astype(int)
+        if "is_canceled" in df.columns
+        else np.zeros(len(df), dtype=int)
+    )
+
+    total_realized_profit = 0.0
+    for i, dec in enumerate(result.decisions):
+        if dec == 1:
+            if y_true_arr[i] == 0:
+                total_realized_profit += float(gross_rev_arr[i])
+            else:
+                total_realized_profit -= request.cancellation_penalty
+
     # Cache for report
     _state["last_optimize"] = {
         "n_accepted":             result.n_accepted,
@@ -405,6 +445,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         n_accepted=result.n_accepted,
         n_rejected=result.n_rejected,
         total_expected_revenue=round(result.total_expected_revenue, 2),
+        total_realized_profit=round(total_realized_profit, 2),
         expected_occupancy=round(result.expected_occupancy, 2),
         solver_status=result.solver_status,
         params_used={
@@ -412,7 +453,12 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
             "cancellation_penalty": request.cancellation_penalty,
             "lambda_risk":          request.lambda_risk,
         },
-        decisions=_opt_result_to_dict(result),
+        decisions=_opt_result_to_dict(
+            result,
+            y_true=y_true_arr,
+            gross_rev=gross_rev_arr,
+            penalty=request.cancellation_penalty,
+        ),
     )
 
 
@@ -509,12 +555,11 @@ async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, A
             realized_profit -= request.cancellation_penalty
 
     return {
-        "bookings_accepted":       n,
-        "total_expected_value":    round(float(ev_per_booking.sum()), 2),
-        "total_gross_revenue":     round(float(gross_rev.sum()), 2),
-        "avg_cancellation_risk":   round(float(p_cancel.mean()), 4),
-        "realized_cancellations":  realized_cancellations,
-        "realized_profit":         round(realized_profit, 2),
+        "bookings_accepted":         n,
+        "total_realized_profit":     round(realized_profit, 2),
+        "total_gross_revenue":       round(float(gross_rev.sum()), 2),
+        "avg_cancellation_risk":     round(float(p_cancel.mean()), 4),
+        "realized_cancellations":    realized_cancellations,
         "cancellation_penalty_used": request.cancellation_penalty,
     }
 
