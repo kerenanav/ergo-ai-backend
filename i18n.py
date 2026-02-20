@@ -42,11 +42,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "lambda": "Overbooking Lambda",
         # ── Backtesting ───────────────────────────────────────────────────
         "n_bookings": "# Bookings",
+        "period": "Period",
+        "ai_accepted": "AI Accepted",
         "ai_expected_rev": "AI Expected Rev.",
         "ai_realized_rev": "AI Realized Rev.",
         "baseline_realized_rev": "Baseline Realized Rev.",
         "improvement_pct": "Improvement %",
         "total": "Total",
+        "risk_aversion": "Risk Aversion",
+        "bookings_per_period": "Bookings per Period",
+        "backtest_params": (
+            "Parameters used: Cancellation Penalty=€{penalty}  |  "
+            "Capacity={capacity}  |  Risk Aversion={lambda_risk}  |  "
+            "Bookings per Period={n_samples}"
+        ),
         # ── Sensitivity ───────────────────────────────────────────────────
         "penalty_sensitivity": "Sensitivity to Cancellation Penalty (50 % – 200 %)",
         "capacity_sensitivity": "Sensitivity to Capacity (±20 %)",
@@ -105,11 +114,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "lambda": "Lambda Overbooking",
         # ── Backtesting ───────────────────────────────────────────────────
         "n_bookings": "# Prenotazioni",
+        "period": "Periodo",
+        "ai_accepted": "Accettate AI",
         "ai_expected_rev": "Ricavo Atteso AI",
         "ai_realized_rev": "Ricavo Realizzato AI",
         "baseline_realized_rev": "Ricavo Realizzato Baseline",
         "improvement_pct": "Miglioramento %",
         "total": "Totale",
+        "risk_aversion": "Avversione al Rischio",
+        "bookings_per_period": "Prenotazioni per Periodo",
+        "backtest_params": (
+            "Parametri utilizzati: Penalità Cancellazione=€{penalty}  |  "
+            "Capacità={capacity}  |  Avversione al Rischio={lambda_risk}  |  "
+            "Prenotazioni per Periodo={n_samples}"
+        ),
         # ── Sensibilità ──────────────────────────────────────────────────
         "penalty_sensitivity": "Sensibilità alla Penale di Cancellazione (50 % – 200 %)",
         "capacity_sensitivity": "Sensibilità alla Capacità (±20 %)",

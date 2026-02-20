@@ -469,6 +469,18 @@ async def backtest(request: BacktestRequest) -> dict[str, Any]:
     """
     _require_ready()
 
+    print(
+        f"BACKTEST RICEVUTO: n_splits={request.n_splits}  n_samples={request.n_samples}"
+        f"  capacity={request.capacity}  cancellation_penalty={request.cancellation_penalty}"
+        f"  lambda_risk={request.lambda_risk}",
+        flush=True,
+    )
+    logger.info(
+        "/backtest called — n_splits=%d  n_samples=%d  capacity=%.0f  penalty=%.2f  lambda=%.2f",
+        request.n_splits, request.n_samples,
+        request.capacity, request.cancellation_penalty, request.lambda_risk,
+    )
+
     backtester: Backtester  = _state["backtester"]
     df: pd.DataFrame        = _state["df"]
     model_metrics: dict     = _state.get("model_metrics", {})

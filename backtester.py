@@ -125,6 +125,12 @@ class Backtester:
         if model_metrics is None:
             model_metrics = {}
 
+        print(
+            f"BACKTEST PARAMETRI: n_splits={n_splits}  n_samples_per_fold={n_samples_per_fold}"
+            f"  capacity={params.capacity}  cancellation_penalty={params.cancellation_penalty}"
+            f"  lambda_risk={params.lambda_risk}",
+            flush=True,
+        )
         logger.info(
             "Starting backtest — n_splits=%d  n_samples=%d  "
             "capacity=%.0f  penalty=%.2f  lambda=%.2f",
@@ -159,6 +165,13 @@ class Backtester:
             else:
                 period_start = str(fold + 1)
                 period_end   = str(fold + 1)
+
+            print(
+                f"  Fold {fold+1}: period={period_start}→{period_end}"
+                f"  n={n_sample}  capacity={params.capacity}"
+                f"  penalty={params.cancellation_penalty}  lambda={params.lambda_risk}",
+                flush=True,
+            )
 
             # Predict with pre-trained model (no retraining)
             p_cancel = self.predictor.predict_proba(df_sample)

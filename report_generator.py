@@ -231,8 +231,9 @@ def generate_report(
         if folds:
             headers = [
                 t("fold", lang),
+                t("period", lang),
                 t("n_bookings", lang),
-                "AUC",
+                t("ai_accepted", lang),
                 t("ai_realized_rev", lang),
                 t("baseline_realized_rev", lang),
                 t("improvement_pct", lang),
@@ -240,10 +241,12 @@ def generate_report(
             rows = []
             for f in folds:
                 imp_cell = _pct_color(f["improvement_pct"])
+                period = f'{f.get("period_start", "–")} → {f.get("period_end", "–")}'
                 rows.append([
                     str(f["fold"]),
+                    period,
                     f'{f["n_bookings"]:,}',
-                    f'{f["auc"]:.4f}',
+                    str(f.get("ai_accepted", "–")),
                     f'${f["ai_realized_revenue"]:,.0f}',
                     f'${f["baseline_realized_revenue"]:,.0f}',
                     imp_cell,
@@ -255,8 +258,7 @@ def generate_report(
             total_imp  = backtest_summary.get("total_improvement_pct", 0.0)
             rows.append([
                 f'<b>{t("total", lang)}</b>',
-                "",
-                "",
+                "", "", "",
                 f"<b>${total_ai:,.0f}</b>",
                 f"<b>${total_base:,.0f}</b>",
                 _pct_color(total_imp),
@@ -265,19 +267,22 @@ def generate_report(
             tbl = Table(
                 [[Paragraph(h, sty_note) for h in headers]]
                 + [[Paragraph(str(c), sty_note) for c in row] for row in rows],
-                colWidths=_col_widths(0.07, 0.12, 0.10, 0.22, 0.22, 0.17),
+                colWidths=_col_widths(0.05, 0.22, 0.09, 0.10, 0.18, 0.18, 0.10),
             )
             tbl.setStyle(_table_style())
             story.append(tbl)
 
         story.append(Spacer(1, 0.3 * cm))
 
-        # Backtest params
+        # Backtest params — full parameter display
         bparams = backtest_summary.get("params", {})
         story.append(Paragraph(
-            f'<i>{t("capacity", lang)}: {bparams.get("capacity", "–")}  |  '
-            f'{t("penalty", lang)}: €{bparams.get("cancellation_penalty", "–")}  |  '
-            f'λ: {bparams.get("lambda_risk", "–")}</i>',
+            f'<i>{t("backtest_params", lang).format(
+                penalty=bparams.get("cancellation_penalty", "–"),
+                capacity=bparams.get("capacity", "–"),
+                lambda_risk=bparams.get("lambda_risk", "–"),
+                n_samples=bparams.get("n_samples_per_fold", "–"),
+            )}</i>',
             sty_note,
         ))
 
