@@ -220,6 +220,7 @@ class OptimizeRequest(BaseModel):
     cancellation_penalty: float     = 50.0
     capacity: float                 = 100.0
     lambda_risk: float              = 1.0
+    n_samples: int                  = Field(default=100, ge=10, le=500, description="Number of bookings to sample from the dataset")
 
 
 class OptimizeResponse(BaseModel):
@@ -355,20 +356,20 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     """
     _require_ready()
 
-    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}", flush=True)
+    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}, n_samples={request.n_samples}", flush=True)
     logger.info(
-        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f",
-        request.capacity, request.cancellation_penalty, request.lambda_risk,
+        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f  n_samples=%d",
+        request.capacity, request.cancellation_penalty, request.lambda_risk, request.n_samples,
     )
 
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
     df_full:   pd.DataFrame          = _state["df"]
 
-    # Sample 20 real bookings from the loaded dataset (bookings from frontend are ignored)
-    n_sample = 20
+    # Sample n_samples real bookings from the loaded dataset (bookings from frontend are ignored)
+    n_sample = min(request.n_samples, len(df_full))
     rng = np.random.default_rng(RANDOM_SEED)
-    idx = rng.choice(len(df_full), size=min(n_sample, len(df_full)), replace=False)
+    idx = rng.choice(len(df_full), size=n_sample, replace=False)
     df = df_full.iloc[idx].copy().reset_index(drop=True)
 
     try:
@@ -415,8 +416,40 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
 
 
 # ---------------------------------------------------------------------------
-# POST /backtest
+# GET /dataset_info
+# ---------------------------------------------------------------------------
 
+@app.get("/dataset_info", tags=["system"], summary="Info sul dataset caricato")
+async def dataset_info() -> dict[str, Any]:
+    """Restituisce statistiche sul dataset hotel_bookings caricato in memoria."""
+    _require_ready()
+
+    df: pd.DataFrame = _state["df"]
+
+    # Date range
+    date_min = str(df["arrival_date"].min().date()) if "arrival_date" in df.columns else None
+    date_max = str(df["arrival_date"].max().date()) if "arrival_date" in df.columns else None
+
+    # Distribuzione per hotel
+    hotel_dist = df["hotel"].value_counts().to_dict() if "hotel" in df.columns else {}
+
+    # Distribuzione per market_segment
+    segment_dist = (
+        df["market_segment"].value_counts().to_dict()
+        if "market_segment" in df.columns else {}
+    )
+
+    return {
+        "total_rows":        len(df),
+        "date_range":        {"min": date_min, "max": date_max},
+        "hotel_distribution":   hotel_dist,
+        "segment_distribution": segment_dist,
+        "n_samples_range":   {"min": 10, "max": 500, "default": 100},
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /backtest
 # ---------------------------------------------------------------------------
 
 @app.post(
