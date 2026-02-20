@@ -235,10 +235,11 @@ class OptimizeResponse(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    n_splits: int              = Field(default=5,    ge=2, le=10)
-    capacity: float            = Field(default=100.0, ge=1)
+    n_splits: int               = Field(default=5,    ge=2,  le=10)
+    n_samples: int              = Field(default=100,  ge=10, le=500, description="Bookings sampled per time window")
+    capacity: float             = Field(default=100.0, ge=1)
     cancellation_penalty: float = Field(default=50.0, ge=0)
-    lambda_risk: float         = Field(default=1.0,  ge=0)
+    lambda_risk: float          = Field(default=1.0,  ge=0)
 
 
 class SensitivityRequest(BaseModel):
@@ -459,16 +460,18 @@ async def dataset_info() -> dict[str, Any]:
 )
 async def backtest(request: BacktestRequest) -> dict[str, Any]:
     """
-    Run TimeSeriesSplit rolling backtest on the full dataset.
+    Temporal backtest: AI strategy vs accept-all baseline.
 
-    Each fold trains a fresh model on chronologically earlier data, predicts
-    on the next window, optimises decisions, and computes realised revenue
-    against the ground-truth cancellation outcomes.
+    The dataset is split into n_splits chronological windows.
+    For each window, n_samples bookings are sampled, the pre-trained model
+    predicts P(cancel), the MILP optimiser makes accept/reject decisions,
+    and realised revenue is computed from actual is_canceled outcomes.
     """
     _require_ready()
 
     backtester: Backtester  = _state["backtester"]
     df: pd.DataFrame        = _state["df"]
+    model_metrics: dict     = _state.get("model_metrics", {})
 
     params = OptimizationParams(
         capacity=request.capacity,
@@ -477,7 +480,13 @@ async def backtest(request: BacktestRequest) -> dict[str, Any]:
     )
 
     try:
-        summary: BacktestSummary = backtester.run(df, params, n_splits=request.n_splits)
+        summary: BacktestSummary = backtester.run(
+            df,
+            params,
+            n_splits=request.n_splits,
+            n_samples_per_fold=request.n_samples,
+            model_metrics=model_metrics,
+        )
     except Exception as exc:
         logger.exception("Backtest failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
