@@ -395,7 +395,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     }
 
     return OptimizeResponse(
-        n_bookings=n,
+        n_bookings=len(request.bookings),
         n_accepted=result.n_accepted,
         n_rejected=result.n_rejected,
         total_expected_revenue=round(result.total_expected_revenue, 2),
