@@ -99,6 +99,8 @@ class DecisionEngine:
         if n == 0:
             return self._empty_result()
 
+        print(f"PARAMETRI OTTIMIZZAZIONE: capacity={params.capacity}, cancellation_penalty={params.cancellation_penalty}, lambda_overbooking={params.lambda_overbooking}, n_bookings={n}", flush=True)
+
         # ── Extract financial inputs ────────────────────────────────────
         adr = df_bookings["adr"].fillna(0).values.astype(np.float64)
 

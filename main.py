@@ -363,6 +363,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
         request.capacity, request.cancellation_penalty,
         request.lambda_overbooking, len(request.bookings),
     )
+    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_overbooking={request.lambda_overbooking}, n_bookings={len(request.bookings)}", flush=True)
 
     df = _bookings_to_df(request.bookings)
 
