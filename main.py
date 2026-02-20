@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+import joblib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -52,6 +53,7 @@ logger = logging.getLogger("ergo_ai")
 # Config
 # ---------------------------------------------------------------------------
 DATA_PATH   = "hotel_bookings.csv"
+MODEL_PATH  = "model.pkl"
 RANDOM_SEED = 42
 
 # ---------------------------------------------------------------------------
@@ -66,12 +68,8 @@ _state: dict[str, Any] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Train the model and prepare all singletons at startup."""
+    """Load pre-trained model and prepare all singletons at startup."""
     logger.info("Ergo.ai starting up …")
-
-    predictor  = CancellationPredictor(data_path=DATA_PATH)
-    engine     = DecisionEngine()
-    backtester = Backtester(predictor, engine)
 
     if not Path(DATA_PATH).exists():
         logger.warning(
@@ -82,8 +80,24 @@ async def lifespan(app: FastAPI):
         )
         _state["ready"] = False
     else:
-        df             = predictor.load_raw()
-        model_metrics  = predictor.fit(df)
+        if Path(MODEL_PATH).exists():
+            logger.info("Loading pre-trained model from %s …", MODEL_PATH)
+            predictor = joblib.load(MODEL_PATH)
+        else:
+            logger.warning("model.pkl not found — training from scratch (slow) …")
+            predictor = CancellationPredictor(data_path=DATA_PATH)
+            df_train  = predictor.load_raw()
+            predictor.fit(df_train)
+
+        engine     = DecisionEngine()
+        backtester = Backtester(predictor, engine)
+
+        df = predictor.load_raw()
+        model_metrics = {
+            "cv_metrics": predictor.cv_metrics,
+            "mean_auc":   round(float(np.mean([m["auc"]   for m in predictor.cv_metrics])), 4),
+            "mean_brier": round(float(np.mean([m["brier"] for m in predictor.cv_metrics])), 4),
+        }
 
         _state.update(
             predictor=predictor,
