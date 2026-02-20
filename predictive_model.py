@@ -103,7 +103,7 @@ class CancellationPredictor:
     """
 
     def __init__(self, data_path: str = "hotel_bookings.csv") -> None:
-        self.data_path = Path(data_path)
+        self.data_path = str(data_path)
         self.model: CalibratedClassifierCV | None = None
         self.label_encoders: dict[str, LabelEncoder] = {}
         self.cv_metrics: list[dict[str, Any]] = []

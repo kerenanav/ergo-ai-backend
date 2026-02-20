@@ -25,7 +25,6 @@ import os
 from contextlib import asynccontextmanager
 import joblib
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -71,7 +70,7 @@ async def lifespan(app: FastAPI):
     """Load pre-trained model and prepare all singletons at startup."""
     logger.info("Ergo.ai starting up …")
 
-    if not Path(DATA_PATH).exists():
+    if not os.path.exists(DATA_PATH):
         logger.warning(
             "Dataset not found at '%s'. "
             "Download hotel_bookings.csv from Kaggle (jessemostipak/hotel-booking-demand) "
@@ -80,7 +79,7 @@ async def lifespan(app: FastAPI):
         )
         _state["ready"] = False
     else:
-        if Path(MODEL_PATH).exists():
+        if os.path.exists(MODEL_PATH):
             logger.info("Loading pre-trained model from %s …", MODEL_PATH)
             predictor = joblib.load(MODEL_PATH)
         else:
