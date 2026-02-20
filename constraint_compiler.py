@@ -32,17 +32,15 @@ class OptimizationParams:
     """All tunable parameters for a single optimization run."""
 
     capacity: float
-    """Nominal hotel capacity in rooms."""
+    """Maximum number of bookings that can be accepted (hard count limit)."""
 
     cancellation_penalty: float
     """Financial penalty charged per cancelled booking (€)."""
 
-    lambda_overbooking: float = 1.0
+    lambda_risk: float = 1.0
     """
-    Overbooking multiplier applied to the expected-occupancy constraint.
-    1.0 → no overbooking; 1.2 → 20 % overbooking allowed.
-    Set to a very small positive number (e.g., 0.01) to practically forbid
-    all bookings (extreme risk-aversion scenario in sensitivity analysis).
+    Risk multiplier applied to the risk term in the objective function.
+    Higher values penalise risky (high p_cancel) bookings more aggressively.
     """
 
     extra_constraints: list = field(default_factory=list)
@@ -73,16 +71,14 @@ def compile_constraints(
 
     constraints: list[LinearConstraint] = []
 
-    # ── C1: Expected-occupancy constraint ───────────────────────────────────
-    # Σ x_i · p_nocancel_i  ≤  capacity · λ
-    ub_occ = params.capacity * max(params.lambda_overbooking, 1e-6)
-    A_occ  = p_no_cancel.reshape(1, n)
-    constraints.append(LinearConstraint(A_occ, lb=-np.inf, ub=ub_occ))
+    # ── C1: Hard count constraint ────────────────────────────────────────────
+    # Σ x_i  ≤  capacity   (total accepted bookings cannot exceed capacity)
+    A_count = np.ones((1, n))
+    constraints.append(LinearConstraint(A_count, lb=-np.inf, ub=params.capacity))
 
-    # ── C2: Hard-booking ceiling ────────────────────────────────────────────
-    # Σ x_i  ≤  capacity · λ · δ
-    ub_hard = params.capacity * max(params.lambda_overbooking, 1e-6) * _HARD_CEILING_FACTOR
-    A_hard  = np.ones((1, n))
-    constraints.append(LinearConstraint(A_hard, lb=-np.inf, ub=ub_hard))
+    # ── C2: Expected-occupancy constraint ───────────────────────────────────
+    # Σ x_i · p_nocancel_i  ≤  capacity
+    A_occ = p_no_cancel.reshape(1, n)
+    constraints.append(LinearConstraint(A_occ, lb=-np.inf, ub=params.capacity))
 
     return constraints

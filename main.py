@@ -216,10 +216,10 @@ class PredictResponse(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    cancellation_penalty: float = 50.0
-    capacity: float             = 100.0
-    lambda_risk: float          = 1.0
-    n_bookings: int             = 5
+    bookings: list[BookingFeatures] = Field(..., min_length=1)
+    cancellation_penalty: float     = 50.0
+    capacity: float                 = 100.0
+    lambda_risk: float              = 1.0
 
 
 class OptimizeResponse(BaseModel):
@@ -237,7 +237,7 @@ class BacktestRequest(BaseModel):
     n_splits: int              = Field(default=5,    ge=2, le=10)
     capacity: float            = Field(default=100.0, ge=1)
     cancellation_penalty: float = Field(default=50.0, ge=0)
-    lambda_overbooking: float  = Field(default=1.0,  ge=0)
+    lambda_risk: float         = Field(default=1.0,  ge=0)
 
 
 class SensitivityRequest(BaseModel):
@@ -355,25 +355,20 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     """
     _require_ready()
 
-    print(f"PARAMETRI RICEVUTI: {request}", flush=True)
+    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}, n_bookings={len(request.bookings)}", flush=True)
     logger.info(
-        "/optimize called — capacity=%.0f  penalty=%.2f  lambda=%.2f  n_bookings=%d",
+        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f  bookings=%d",
         request.capacity, request.cancellation_penalty,
-        request.lambda_risk, request.n_bookings,
+        request.lambda_risk, len(request.bookings),
     )
 
     predictor: CancellationPredictor = _state["predictor"]
     engine:    DecisionEngine        = _state["engine"]
-    df_full:   pd.DataFrame          = _state["df"]
 
-    # Sample n_bookings from the already-loaded dataset
-    n = min(request.n_bookings, len(df_full))
-    rng = np.random.default_rng(RANDOM_SEED)
-    idx = rng.choice(len(df_full), size=n, replace=False)
-    df = df_full.iloc[idx].copy().reset_index(drop=True)
+    df = _bookings_to_df(request.bookings)
 
     try:
-        p_cancel = predictor.predict_proba(df)
+        p_cancel = predictor.predict_from_raw(df)
     except Exception as exc:
         logger.exception("Prediction step failed inside /optimize")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -381,7 +376,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
     params = OptimizationParams(
         capacity=request.capacity,
         cancellation_penalty=request.cancellation_penalty,
-        lambda_overbooking=request.lambda_risk,
+        lambda_risk=request.lambda_risk,
     )
 
     try:
@@ -417,6 +412,7 @@ async def optimize(request: OptimizeRequest) -> OptimizeResponse:
 
 # ---------------------------------------------------------------------------
 # POST /backtest
+
 # ---------------------------------------------------------------------------
 
 @app.post(
@@ -440,7 +436,7 @@ async def backtest(request: BacktestRequest) -> dict[str, Any]:
     params = OptimizationParams(
         capacity=request.capacity,
         cancellation_penalty=request.cancellation_penalty,
-        lambda_overbooking=request.lambda_overbooking,
+        lambda_risk=request.lambda_risk,
     )
 
     try:
@@ -512,7 +508,7 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
     base_params = OptimizationParams(
         capacity=request.capacity,
         cancellation_penalty=request.base_penalty,
-        lambda_overbooking=request.base_lambda,
+        lambda_risk=request.base_lambda,
     )
 
     def _run_opt(params: OptimizationParams) -> dict[str, Any]:
@@ -530,7 +526,7 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
         p     = OptimizationParams(
             capacity=base_params.capacity,
             cancellation_penalty=base_params.cancellation_penalty * float(m),
-            lambda_overbooking=base_params.lambda_overbooking,
+            lambda_risk=base_params.lambda_risk,
         )
         entry = _run_opt(p)
         entry["penalty_multiplier"] = round(float(m), 4)
@@ -544,7 +540,7 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
         p     = OptimizationParams(
             capacity=base_params.capacity * float(m),
             cancellation_penalty=base_params.cancellation_penalty,
-            lambda_overbooking=base_params.lambda_overbooking,
+            lambda_risk=base_params.lambda_risk,
         )
         entry = _run_opt(p)
         entry["capacity_multiplier"] = round(float(m), 4)
@@ -559,7 +555,7 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
         p       = OptimizationParams(
             capacity=base_params.capacity,
             cancellation_penalty=base_params.cancellation_penalty,
-            lambda_overbooking=eff_lam,
+            lambda_risk=eff_lam,
         )
         entry         = _run_opt(p)
         entry["lambda"] = round(float(lam), 4)

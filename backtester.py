@@ -127,7 +127,7 @@ class Backtester:
         """
         logger.info(
             "Starting backtest — n_splits=%d  capacity=%.0f  penalty=%.2f  λ=%.2f",
-            n_splits, params.capacity, params.cancellation_penalty, params.lambda_overbooking,
+            n_splits, params.capacity, params.cancellation_penalty, params.lambda_risk,
         )
 
         splits        = self.predictor.fit_and_predict_splits(df, n_splits=n_splits)
@@ -208,7 +208,7 @@ class Backtester:
             params={
                 "capacity":             params.capacity,
                 "cancellation_penalty": params.cancellation_penalty,
-                "lambda_overbooking":   params.lambda_overbooking,
+                "lambda_risk":          params.lambda_risk,
             },
         )
 

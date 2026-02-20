@@ -277,7 +277,7 @@ def generate_report(
         story.append(Paragraph(
             f'<i>{t("capacity", lang)}: {bparams.get("capacity", "–")}  |  '
             f'{t("penalty", lang)}: €{bparams.get("cancellation_penalty", "–")}  |  '
-            f'λ: {bparams.get("lambda_overbooking", "–")}</i>',
+            f'λ: {bparams.get("lambda_risk", "–")}</i>',
             sty_note,
         ))
 

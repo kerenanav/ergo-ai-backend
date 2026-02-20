@@ -39,6 +39,12 @@ class BookingFinancials:
     cancellation_penalty: float
     """Flat penalty charged per cancellation (€)."""
 
+    lambda_risk: float = 0.0
+    """
+    Risk multiplier for the risk term in the objective.
+    Higher values penalise bookings with high p_cancel more aggressively.
+    """
+
     def __post_init__(self) -> None:
         self.adr           = np.asarray(self.adr,          dtype=np.float64)
         self.total_nights  = np.asarray(self.total_nights,  dtype=np.float64)
@@ -63,9 +69,21 @@ class BookingFinancials:
         """
         Expected profit for each booking:
 
-            EV_i = P(show_i) · gross_rev_i  −  P(cancel_i) · penalty
+            EV_i = gross_revenue_i · P(show_i)
+                   − cancellation_penalty · P(cancel_i)
+                   − lambda_risk · P(cancel_i) · gross_revenue_i
+
+        The risk term  lambda_risk · P(cancel_i) · gross_revenue_i
+        penalises bookings where both cancellation probability and
+        revenue at stake are high. lambda_risk = 0 collapses to the
+        standard EV formula.
         """
-        return self.p_no_cancel * self.gross_revenue - self.p_cancel * self.cancellation_penalty
+        risk_term = self.lambda_risk * self.p_cancel * self.gross_revenue
+        return (
+            self.p_no_cancel * self.gross_revenue
+            - self.cancellation_penalty * self.p_cancel
+            - risk_term
+        )
 
 
 def build_objective(financials: BookingFinancials) -> np.ndarray:

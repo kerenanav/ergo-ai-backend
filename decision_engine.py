@@ -99,7 +99,7 @@ class DecisionEngine:
         if n == 0:
             return self._empty_result()
 
-        print(f"PARAMETRI OTTIMIZZAZIONE: capacity={params.capacity}, cancellation_penalty={params.cancellation_penalty}, lambda_overbooking={params.lambda_overbooking}, n_bookings={n}", flush=True)
+        print(f"PARAMETRI OTTIMIZZAZIONE: capacity={params.capacity}, cancellation_penalty={params.cancellation_penalty}, lambda_risk={params.lambda_risk}, n_bookings={n}", flush=True)
 
         # ── Extract financial inputs ────────────────────────────────────
         adr = df_bookings["adr"].fillna(0).values.astype(np.float64)
@@ -122,6 +122,7 @@ class DecisionEngine:
             total_nights=nights,
             p_cancel=p_cancel,
             cancellation_penalty=params.cancellation_penalty,
+            lambda_risk=params.lambda_risk,
         )
 
         c           = build_objective(financials)          # shape (n,) to minimise
@@ -184,25 +185,24 @@ class DecisionEngine:
         financials: BookingFinancials,
         params: OptimizationParams,
     ) -> np.ndarray:
-        """Accept bookings in descending EV order until capacity is exhausted."""
-        ev           = financials.expected_value
-        p_show       = financials.p_no_cancel
-        cap_limit    = params.capacity * max(params.lambda_overbooking, 1e-6)
+        """Accept bookings in descending EV order until capacity count is reached."""
+        ev        = financials.expected_value
+        cap_limit = int(round(params.capacity))
 
         order     = np.argsort(-ev)   # descending expected value
         decisions = np.zeros(len(ev), dtype=int)
-        used      = 0.0
+        count     = 0
 
         for i in order:
             if ev[i] <= 0.0:          # no-value or negative-value booking
                 break
-            if used + p_show[i] <= cap_limit:
+            if count < cap_limit:
                 decisions[i] = 1
-                used         += p_show[i]
+                count        += 1
 
         logger.info(
-            "Greedy fallback — accepted %d/%d  expected_occ=%.1f",
-            decisions.sum(), len(ev), used,
+            "Greedy fallback — accepted %d/%d  capacity=%d",
+            decisions.sum(), len(ev), cap_limit,
         )
         return decisions
 
