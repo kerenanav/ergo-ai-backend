@@ -450,6 +450,76 @@ async def dataset_info() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# POST /historical_baseline
+# ---------------------------------------------------------------------------
+
+class HistoricalBaselineRequest(BaseModel):
+    n_samples: int            = Field(default=100, ge=10, le=500)
+    cancellation_penalty: float = Field(default=50.0, ge=0)
+
+
+@app.post(
+    "/historical_baseline",
+    tags=["analysis"],
+    summary="Simulate accept-all historical baseline on a random sample",
+)
+async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, Any]:
+    """
+    Accept all n_samples bookings without optimisation (historical baseline).
+    Uses actual is_canceled outcomes to compute realised profit/loss.
+    """
+    _require_ready()
+
+    predictor: CancellationPredictor = _state["predictor"]
+    df_full:   pd.DataFrame          = _state["df"]
+
+    # Same fixed seed as /optimize for consistency
+    n = min(request.n_samples, len(df_full))
+    rng = np.random.default_rng(RANDOM_SEED)
+    idx = rng.choice(len(df_full), size=n, replace=False)
+    df = df_full.iloc[idx].copy().reset_index(drop=True)
+
+    # Predict P(cancel) for expected-value stats
+    p_cancel = predictor.predict_proba(df)
+
+    # Gross revenue: adr × (weekend + week nights)
+    adr = df["adr"].fillna(0).values
+    weekend = df["stays_in_weekend_nights"].fillna(0).values
+    weekday = df["stays_in_week_nights"].fillna(0).values
+    nights = np.maximum(weekend + weekday, 1.0)
+    gross_rev = adr * nights
+
+    # Expected value per booking (accept-all, no optimisation)
+    p_no_cancel = 1.0 - p_cancel
+    ev_per_booking = p_no_cancel * gross_rev - p_cancel * request.cancellation_penalty
+
+    # Realised outcome using actual is_canceled
+    y_true = (
+        df["is_canceled"].values.astype(int)
+        if "is_canceled" in df.columns
+        else np.zeros(n, dtype=int)
+    )
+    realized_cancellations = int(y_true.sum())
+
+    realized_profit = 0.0
+    for i in range(n):
+        if y_true[i] == 0:
+            realized_profit += float(gross_rev[i])
+        else:
+            realized_profit -= request.cancellation_penalty
+
+    return {
+        "bookings_accepted":       n,
+        "total_expected_value":    round(float(ev_per_booking.sum()), 2),
+        "total_gross_revenue":     round(float(gross_rev.sum()), 2),
+        "avg_cancellation_risk":   round(float(p_cancel.mean()), 4),
+        "realized_cancellations":  realized_cancellations,
+        "realized_profit":         round(realized_profit, 2),
+        "cancellation_penalty_used": request.cancellation_penalty,
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /backtest
 # ---------------------------------------------------------------------------
 
