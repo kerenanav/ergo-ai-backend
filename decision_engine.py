@@ -125,6 +125,29 @@ class DecisionEngine:
             lambda_risk=params.lambda_risk,
         )
 
+        # ── Per-booking diagnostic log ─────────────────────────────────────
+        ev_pre  = financials.p_no_cancel * financials.gross_revenue - params.cancellation_penalty * financials.p_cancel
+        risk_v  = params.lambda_risk * financials.p_cancel * financials.p_no_cancel * financials.gross_revenue
+        ev_post = financials.expected_value
+        print(
+            f"{'#':>4}  {'gross_rev':>10}  {'p_cancel':>8}  "
+            f"{'EV_pre_risk':>12}  {'risk_term':>10}  {'EV_post_risk':>12}",
+            flush=True,
+        )
+        for i in range(n):
+            print(
+                f"{i:>4}  {financials.gross_revenue[i]:>10.2f}  {financials.p_cancel[i]:>8.4f}  "
+                f"{ev_pre[i]:>12.2f}  {risk_v[i]:>10.2f}  {ev_post[i]:>12.2f}",
+                flush=True,
+            )
+        n_pos = int((ev_post > 0).sum())
+        print(
+            f"[diag] bookings with EV>0: {n_pos}/{n}  "
+            f"lambda={params.lambda_risk}  penalty={params.cancellation_penalty}  capacity={params.capacity}",
+            flush=True,
+        )
+        # ───────────────────────────────────────────────────────────────────
+
         c           = build_objective(financials)          # shape (n,) to minimise
         p_no_cancel = financials.p_no_cancel
         constraints = compile_constraints(p_no_cancel, params)
@@ -158,6 +181,15 @@ class DecisionEngine:
             )
             decisions     = self._greedy_fallback(financials, params)
             solver_status = "greedy_fallback"
+
+        # ── Per-booking decision log ───────────────────────────────────────
+        for i in range(n):
+            print(
+                f"  booking {i:>3}  EV={ev_post[i]:>8.2f}  "
+                f"decision={'ACCEPT' if decisions[i] == 1 else 'reject'}",
+                flush=True,
+            )
+        # ──────────────────────────────────────────────────────────────────
 
         # ── Build result ───────────────────────────────────────────────
         ev              = financials.expected_value

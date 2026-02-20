@@ -71,14 +71,13 @@ class BookingFinancials:
 
             EV_i = gross_revenue_i · P(show_i)
                    − cancellation_penalty · P(cancel_i)
-                   − lambda_risk · P(cancel_i) · gross_revenue_i
+                   − lambda_risk · P(cancel_i) · P(show_i) · gross_revenue_i
 
-        The risk term  lambda_risk · P(cancel_i) · gross_revenue_i
-        penalises bookings where both cancellation probability and
-        revenue at stake are high. lambda_risk = 0 collapses to the
-        standard EV formula.
+        The risk term is proportional to the variance of the booking's profit
+        (Var = p*(1-p)*gross_revenue), so it is always bounded.
+        lambda_risk = 0 collapses to the standard EV formula.
         """
-        risk_term = self.lambda_risk * self.p_cancel * self.gross_revenue
+        risk_term = self.lambda_risk * self.p_cancel * self.p_no_cancel * self.gross_revenue
         return (
             self.p_no_cancel * self.gross_revenue
             - self.cancellation_penalty * self.p_cancel
