@@ -380,8 +380,11 @@ class ReportRequest(BaseModel):
 
 
 class HistoricalBaselineRequest(BaseModel):
-    scope_id:             str
-    cancellation_penalty: Optional[float] = None
+    scope_id:             Optional[str]   = None
+    cancellation_penalty: float           = 50.0
+    capacity:             float           = 100.0
+    lambda_risk:          float           = 0.0
+    n_samples:            int             = Field(default=100, ge=1, le=10_000)
 
 
 class ConfirmMappingRequest(BaseModel):
@@ -1231,41 +1234,57 @@ async def report(request: ReportRequest) -> Response:
 @app.post("/historical_baseline", tags=["analysis"])
 async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, Any]:
     """
-    Accept-all baseline on a scope's bookings using actual outcome data.
+    Accept-all baseline using actual outcome data.
+
+    With scope_id: uses the scope's selected UIDs (scope must exist).
+    Without scope_id: samples n_samples rows from hotel_v1 (default domain).
     Returns 422 if outcome data is unavailable.
     """
     _require_ready()
-    scope     = _require_scope(request.scope_id)
-    domain_id = scope.domain_config_id
-    cfg       = _require_domain(domain_id)
 
-    df = _scope_df(scope, domain_id)
+    if request.scope_id is not None:
+        # ── Scope-based path ──────────────────────────────────────────────────
+        scope     = _require_scope(request.scope_id)
+        domain_id = scope.domain_config_id
+        cfg       = _require_domain(domain_id)
+        df        = _scope_df(scope, domain_id)
+        penalty   = request.cancellation_penalty
+        scope_id_out = scope.scope_id
+    else:
+        # ── Scopeless path (default domain = hotel_v1) ────────────────────────
+        domain_id = "hotel_v1"
+        cfg       = _require_domain(domain_id)
+        df_full   = _state["datasets"].get(domain_id)
+        if df_full is None:
+            raise HTTPException(status_code=503, detail=f"Dataset for '{domain_id}' not loaded.")
+        n = min(request.n_samples, len(df_full))
+        rng = np.random.default_rng(RANDOM_SEED)
+        idx = rng.choice(len(df_full), size=n, replace=False)
+        df  = df_full.iloc[idx].copy().reset_index(drop=True)
+        penalty      = request.cancellation_penalty
+        scope_id_out = None
 
     if not _outcome_available(df, cfg):
         raise HTTPException(
             status_code=422,
-            detail="Outcome data not available for this scope (real-time data).",
+            detail="Outcome data not available for this dataset (real-time data).",
         )
 
-    snap    = scope.params_snapshot
-    penalty = request.cancellation_penalty \
-              if request.cancellation_penalty is not None \
-              else snap.get("cancellation_penalty", cfg.cancellation_penalty_default)
-
-    gross_rev = evaluate_revenue(df, cfg.revenue_formula)
-    y_true    = df[cfg.ml_target_column].values.astype(int)
-    n         = len(df)
-
-    realized = _realized_profit(np.ones(n, dtype=int), y_true, gross_rev, penalty)
+    gross_rev     = evaluate_revenue(df, cfg.revenue_formula)
+    y_true        = df[cfg.ml_target_column].values.astype(int)
+    n             = len(df)
+    realized      = _realized_profit(np.ones(n, dtype=int), y_true, gross_rev, penalty)
     cancellations = int(y_true.sum())
 
     logger.info(
-        "[baseline scope=%s] n=%d  cancellations=%d  realized=%.0f",
-        scope.scope_id, n, cancellations, realized,
+        "[baseline %s] n=%d  cancellations=%d  realized=%.0f",
+        f"scope={scope_id_out}" if scope_id_out else "no-scope",
+        n, cancellations, realized,
     )
 
     return {
-        "scope_id":                  scope.scope_id,
+        "scope_id":                  scope_id_out,
+        "domain_id":                 domain_id,
         "bookings_accepted":         n,
         "total_realized_profit":     round(realized, 2),
         "total_gross_revenue":       round(float(gross_rev.sum()), 2),
