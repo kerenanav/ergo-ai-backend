@@ -294,6 +294,47 @@ def _scope_df(scope: Scope, domain_id: str) -> pd.DataFrame:
     return df
 
 
+def _ensure_arrival_date(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure df has an 'arrival_date' column (datetime).
+    If absent, reconstruct it from year/month/day_of_month columns.
+    No-op if the column already exists.
+    """
+    if "arrival_date" in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df["arrival_date"]):
+            df = df.copy()
+            df["arrival_date"] = pd.to_datetime(df["arrival_date"], errors="coerce")
+        return df
+
+    year_col  = next((c for c in df.columns if "year"        in c.lower()), None)
+    month_col = next((c for c in df.columns if "month"       in c.lower() and "day" not in c.lower()), None)
+    day_col   = next((c for c in df.columns if "day_of_month" in c.lower()), None)
+
+    if year_col and month_col and day_col:
+        df = df.copy()
+        df["arrival_date"] = pd.to_datetime(
+            df[year_col].astype(str) + "-" +
+            df[month_col].astype(str) + "-" +
+            df[day_col].astype(str),
+            errors="coerce",
+        )
+    return df
+
+
+def _apply_date_filter(df: pd.DataFrame, start_date: str | None, end_date: str | None) -> pd.DataFrame:
+    """Filter df rows by arrival_date. Ensures arrival_date column exists first."""
+    if not start_date and not end_date:
+        return df
+    df = _ensure_arrival_date(df)
+    if "arrival_date" not in df.columns:
+        return df          # can't filter — column not constructable
+    if start_date:
+        df = df[df["arrival_date"] >= pd.Timestamp(start_date)]
+    if end_date:
+        df = df[df["arrival_date"] <= pd.Timestamp(end_date)]
+    return df.reset_index(drop=True)
+
+
 def _outcome_available(df: pd.DataFrame, cfg: DomainConfig) -> bool:
     target = cfg.ml_target_column
     if not target:
@@ -351,6 +392,9 @@ class OptimizeRequest(BaseModel):
     # Format B/C (scopeless): domain_id optional; defaults to "hotel_v1" if omitted
     domain_id:            Optional[str]   = None
     n_samples:            int             = Field(default=100, ge=1, le=10_000)
+    # Date filter (applied before sampling in Format B/C)
+    start_date:           Optional[str]   = None
+    end_date:             Optional[str]   = None
     # Shared params — have defaults so the frontend can omit them
     cancellation_penalty: float           = 50.0
     capacity:             float           = 100.0
@@ -381,6 +425,8 @@ class ReportRequest(BaseModel):
 
 class HistoricalBaselineRequest(BaseModel):
     scope_id:             Optional[str]   = None
+    start_date:           Optional[str]   = None
+    end_date:             Optional[str]   = None
     cancellation_penalty: float           = 50.0
     capacity:             float           = 100.0
     lambda_risk:          float           = 0.0
@@ -828,10 +874,13 @@ async def optimize(request: OptimizeRequest) -> dict[str, Any]:
         df_full = _state["datasets"].get(domain_id)
         if df_full is None:
             raise HTTPException(status_code=503, detail=f"Dataset for '{domain_id}' not loaded.")
-        n = min(request.n_samples, len(df_full))
+        df_pool = _apply_date_filter(df_full, request.start_date, request.end_date)
+        if len(df_pool) == 0:
+            raise HTTPException(status_code=422, detail="No rows remain after date filter.")
+        n = min(request.n_samples, len(df_pool))
         rng = np.random.default_rng(RANDOM_SEED)
-        idx = rng.choice(len(df_full), size=n, replace=False)
-        df  = df_full.iloc[idx].copy().reset_index(drop=True)
+        idx = rng.choice(len(df_pool), size=n, replace=False)
+        df  = df_pool.iloc[idx].copy().reset_index(drop=True)
 
     # ── Shared optimisation logic ─────────────────────────────────────────────
     params = OptimizationParams(
@@ -1257,10 +1306,13 @@ async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, A
         df_full   = _state["datasets"].get(domain_id)
         if df_full is None:
             raise HTTPException(status_code=503, detail=f"Dataset for '{domain_id}' not loaded.")
-        n = min(request.n_samples, len(df_full))
+        df_pool = _apply_date_filter(df_full, request.start_date, request.end_date)
+        if len(df_pool) == 0:
+            raise HTTPException(status_code=422, detail="No rows remain after date filter.")
+        n = min(request.n_samples, len(df_pool))
         rng = np.random.default_rng(RANDOM_SEED)
-        idx = rng.choice(len(df_full), size=n, replace=False)
-        df  = df_full.iloc[idx].copy().reset_index(drop=True)
+        idx = rng.choice(len(df_pool), size=n, replace=False)
+        df  = df_pool.iloc[idx].copy().reset_index(drop=True)
         penalty      = request.cancellation_penalty
         scope_id_out = None
 
