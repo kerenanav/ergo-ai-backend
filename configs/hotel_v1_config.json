@@ -1,0 +1,54 @@
+{
+  "domain_id": "hotel_v1",
+  "domain_name": "Hotel Booking Demand",
+  "config_version": "1.0",
+  "decision_mode": "row_level",
+  "time_column": null,
+  "time_builder": {
+    "year_col": "arrival_date_year",
+    "month_col": "arrival_date_month",
+    "day_col": "arrival_date_day_of_month"
+  },
+  "action_columns": ["hotel", "reserved_room_type", "market_segment", "distribution_channel"],
+  "resource_columns": ["hotel", "reserved_room_type"],
+  "id_column": null,
+  "uid_strategy": "hash",
+  "uid_key_columns": [
+    "hotel", "arrival_date_year", "arrival_date_month",
+    "arrival_date_day_of_month", "lead_time", "adr"
+  ],
+  "revenue_formula": "adr*(stays_in_weekend_nights+stays_in_week_nights)",
+  "cost_formula": null,
+  "ml_target_column": "is_canceled",
+  "ml_features": [
+    "lead_time", "arrival_date_week_number",
+    "stays_in_weekend_nights", "stays_in_week_nights",
+    "adults", "children", "meal", "country",
+    "market_segment", "distribution_channel",
+    "is_repeated_guest", "previous_cancellations",
+    "previous_bookings_not_canceled", "booking_changes",
+    "deposit_type", "days_in_waiting_list",
+    "customer_type", "adr",
+    "required_car_parking_spaces", "total_of_special_requests"
+  ],
+  "historical_policy": "accept_all",
+  "historical_policy_column": null,
+  "constraints": [
+    {
+      "type": "C1",
+      "resource_key": ["hotel", "reserved_room_type"],
+      "capacity_value": 100,
+      "alpha": 1.0,
+      "time_indexed": true
+    },
+    {
+      "type": "C2",
+      "lower": 0,
+      "upper": 1
+    }
+  ],
+  "cancellation_penalty_default": 50.0,
+  "risk_enabled": false,
+  "lambda_risk_default": 0.0,
+  "dataset_path": "hotel_bookings.csv"
+}

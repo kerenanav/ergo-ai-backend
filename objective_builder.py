@@ -1,19 +1,23 @@
 """
 objective_builder.py — Constructs the MILP objective-function coefficients.
 
-Expected value of accepting booking i
-──────────────────────────────────────
-    EV(i) = P(no_cancel_i) · revenue_i  −  P(cancel_i) · penalty
+Expected value of accepting booking i (V2 form):
+────────────────────────────────────────────────
+    EV(i) = gross_revenue_i · P(show_i) − penalty · P(cancel_i) − Risk(i)
 
 where
-    revenue_i  = adr_i × total_nights_i
+    gross_revenue_i = eval(revenue_formula) for row i   [from DomainConfig]
+    P(show_i)       = 1 − P(cancel_i)
+
+Risk term (V1: always zero):
+    if risk_enabled=True:
+        Risk(i) = λ · P(cancel_i) · P(show_i) · gross_revenue_i
+        [variance-based: bounded by 0.25 · λ · gross_revenue_i]
+    if risk_enabled=False (V1 default):
+        Risk(i) = 0   → lambda_status = "inactive"
 
 The MILP *minimises*, so we negate EV to convert maximisation → minimisation:
-
     c_i = −EV(i)
-
-Bookings with EV(i) < 0 are never worth accepting at the given penalty level;
-the solver will set x_i = 0 automatically once capacity is a binding constraint.
 """
 
 from __future__ import annotations
@@ -27,42 +31,30 @@ import numpy as np
 class BookingFinancials:
     """Vectorised financial quantities for a batch of bookings."""
 
-    adr: np.ndarray
-    """Average Daily Rate per booking (€/night)."""
-
-    total_nights: np.ndarray
-    """Length of stay in nights (must be ≥ 1)."""
+    gross_revenue: np.ndarray
+    """Revenue per booking from evaluate_revenue(df, revenue_formula). Shape (n,)."""
 
     p_cancel: np.ndarray
-    """Cancellation probability from Layer-1 model, shape (n,)."""
+    """Cancellation probability from Layer-1 model. Shape (n,)."""
 
     cancellation_penalty: float
     """Flat penalty charged per cancellation (€)."""
 
     lambda_risk: float = 0.0
-    """
-    Risk multiplier for the risk term in the objective.
-    Higher values penalise bookings with high p_cancel more aggressively.
-    """
+    """Risk multiplier. Only active if risk_enabled=True."""
+
+    risk_enabled: bool = False
+    """False in V1 — risk term is always zero regardless of lambda_risk."""
 
     def __post_init__(self) -> None:
-        self.adr           = np.asarray(self.adr,          dtype=np.float64)
-        self.total_nights  = np.asarray(self.total_nights,  dtype=np.float64)
-        self.p_cancel      = np.asarray(self.p_cancel,      dtype=np.float64)
-        # Clip to valid probability range
-        self.p_cancel = np.clip(self.p_cancel, 0.0, 1.0)
-        # Clip nights to avoid nonsense (0-night stays)
-        self.total_nights = np.maximum(self.total_nights, 1.0)
+        self.gross_revenue = np.asarray(self.gross_revenue, dtype=np.float64)
+        self.p_cancel = np.clip(np.asarray(self.p_cancel, dtype=np.float64), 0.0, 1.0)
+        self.gross_revenue = np.maximum(self.gross_revenue, 0.0)
 
     @property
     def p_no_cancel(self) -> np.ndarray:
         """Show-up probability: 1 − P(cancel)."""
         return 1.0 - self.p_cancel
-
-    @property
-    def gross_revenue(self) -> np.ndarray:
-        """Revenue assuming the guest does not cancel: adr × nights."""
-        return self.adr * self.total_nights
 
     @property
     def expected_value(self) -> np.ndarray:
@@ -71,25 +63,31 @@ class BookingFinancials:
 
             EV_i = gross_revenue_i · P(show_i)
                    − cancellation_penalty · P(cancel_i)
-                   − lambda_risk · P(cancel_i) · P(show_i) · gross_revenue_i
+                   [− λ · P(cancel_i) · P(show_i) · gross_revenue_i  if risk_enabled]
 
-        The risk term is proportional to the variance of the booking's profit
-        (Var = p*(1-p)*gross_revenue), so it is always bounded.
-        lambda_risk = 0 collapses to the standard EV formula.
+        With risk_enabled=False (V1): the risk term is always 0.
+        lambda_status = "inactive" is set in decision_engine.py.
         """
-        risk_term = self.lambda_risk * self.p_cancel * self.p_no_cancel * self.gross_revenue
-        return (
+        base = (
             self.p_no_cancel * self.gross_revenue
             - self.cancellation_penalty * self.p_cancel
-            - risk_term
         )
+        if self.risk_enabled and self.lambda_risk != 0.0:
+            risk_term = (
+                self.lambda_risk
+                * self.p_cancel
+                * self.p_no_cancel
+                * self.gross_revenue
+            )
+            return base - risk_term
+        return base
 
 
 def build_objective(financials: BookingFinancials) -> np.ndarray:
     """Return coefficient vector *c* for scipy.optimize.milp (minimisation).
 
-    The solver minimises ``c @ x``, so we negate the expected-value vector
-    to transform our *maximisation* objective into a minimisation one.
+    The solver minimises ``c @ x``, so we negate EV to transform
+    maximisation → minimisation.
 
     Returns
     -------

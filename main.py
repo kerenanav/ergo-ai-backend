@@ -1,142 +1,209 @@
 """
-main.py — Ergo.ai Decision Intelligence Engine  (FastAPI backend)
+main.py — Optide V2 Decision Intelligence Engine  (FastAPI backend)
 
 Endpoints
 ─────────
-GET  /health        — liveness + model-readiness check
-POST /predict       — P(cancel) per booking  [Layer 1]
-POST /optimize      — MILP accept/reject decisions  [Layer 2]
-POST /backtest      — rolling walk-forward backtest  [Layer 3]
-POST /sensitivity   — sensitivity sweep (penalty / capacity / lambda)
-GET  /report        — PDF report (lang=en|it)
+GET  /health
+GET  /domain/list
+GET  /domain/templates
+POST /scope/create
+POST /scope/clone
+GET  /scope/list
+GET  /scope/{scope_id}
+POST /optimize          → scope_id required; locks scope on success
+POST /backtest          → 409 if not locked | 422 if no outcomes
+POST /sensitivity
+POST /report            → 409 if not locked; returns PDF bytes
+POST /historical_baseline
 
-Start the server (either way works):
+Start:
     python main.py
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-The hotel_bookings.csv file must be in the working directory.
-Download from: https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
-import joblib
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from backtester import Backtester, BacktestSummary
+from backtester import Backtester
+from chart_generator import (
+    capacity_utilization_chart,
+    capacity_sensitivity_chart,
+    decision_distribution_chart,
+    expected_vs_realized_chart,
+    penalty_sensitivity_chart,
+    profit_composition_chart,
+)
 from constraint_compiler import OptimizationParams
 from decision_engine import DecisionEngine, OptimizationResult
+from domain_config import (
+    DomainConfig,
+    add_uid_column,
+    build_time_column,
+    evaluate_revenue,
+    list_domain_configs,
+    load_domain_config,
+    validate_domain_config,
+)
 from predictive_model import CancellationPredictor
 from report_generator import generate_report
+from scope_manager import Scope, ScopeManager
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-logger = logging.getLogger("ergo_ai")
+logger = logging.getLogger("optide")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-DATA_PATH   = "hotel_bookings.csv"
-MODEL_PATH  = "model.pkl"
-RANDOM_SEED = 42
+# ── Constants ─────────────────────────────────────────────────────────────────
+CONFIGS_DIR  = Path("configs")
+SCOPES_DIR   = Path("scopes")
+RANDOM_SEED  = 42
 
-# ---------------------------------------------------------------------------
-# Application state (populated during startup lifespan)
-# ---------------------------------------------------------------------------
-_state: dict[str, Any] = {}
+# ── Application state ─────────────────────────────────────────────────────────
+_state: dict[str, Any] = {
+    "ready":          False,
+    "domain_configs": {},   # domain_id → DomainConfig
+    "datasets":       {},   # domain_id → pd.DataFrame (with _uid, _time)
+    "predictors":     {},   # domain_id → CancellationPredictor
+    "engines":        {},   # domain_id → DecisionEngine
+    "model_metrics":  {},   # domain_id → {cv_metrics, mean_auc, mean_brier}
+    "scope_manager":  None,
+    "results":        {},   # scope_id → optimize result snapshot
+    "backtests":      {},   # scope_id → BacktestSummary.to_dict()
+    "sensitivities":  {},   # scope_id or "global" → sensitivity dict
+}
 
 
-# ---------------------------------------------------------------------------
-# Lifespan: load data and train model on startup
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# Lifespan: load configs, datasets, models
+# ────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load pre-trained model and prepare all singletons at startup."""
-    logger.info("Ergo.ai starting up …")
+    logger.info("Optide V2 starting up …")
 
-    if not os.path.exists(DATA_PATH):
-        logger.warning(
-            "Dataset not found at '%s'. "
-            "Download hotel_bookings.csv from Kaggle (jessemostipak/hotel-booking-demand) "
-            "and place it in the working directory.",
-            DATA_PATH,
-        )
-        _state["ready"] = False
-    else:
-        if os.path.exists(MODEL_PATH):
-            logger.info("Loading pre-trained model from %s …", MODEL_PATH)
-            predictor = joblib.load(MODEL_PATH)
-        else:
-            logger.warning("model.pkl not found — training from scratch (slow) …")
-            predictor = CancellationPredictor(data_path=DATA_PATH)
-            df_train  = predictor.load_raw()
-            predictor.fit(df_train)
+    CONFIGS_DIR.mkdir(exist_ok=True)
+    SCOPES_DIR.mkdir(exist_ok=True)
 
-        engine     = DecisionEngine()
-        backtester = Backtester(predictor, engine)
+    # Scope manager
+    sm = ScopeManager(SCOPES_DIR)
+    sm.load_all()
+    _state["scope_manager"] = sm
 
-        df = predictor.load_raw()
-        model_metrics = {
-            "cv_metrics": predictor.cv_metrics,
-            "mean_auc":   round(float(np.mean([m["auc"]   for m in predictor.cv_metrics])), 4),
-            "mean_brier": round(float(np.mean([m["brier"] for m in predictor.cv_metrics])), 4),
-        }
+    # Discover and load all domain configs
+    domain_ids = list_domain_configs(CONFIGS_DIR)
+    if not domain_ids:
+        logger.warning("No domain configs found in %s/ — server will start but no domains are ready.", CONFIGS_DIR)
 
-        _state.update(
-            predictor=predictor,
-            engine=engine,
-            backtester=backtester,
-            df=df,
-            model_metrics=model_metrics,
-            ready=True,
-            last_backtest=None,
-            last_sensitivity=None,
-            last_optimize=None,
-        )
-        logger.info(
-            "Model ready — Mean AUC=%.4f  Brier=%.4f  rows=%d",
-            model_metrics["mean_auc"],
-            model_metrics["mean_brier"],
-            len(df),
-        )
+    for domain_id in domain_ids:
+        _load_domain(domain_id)
+
+    # Server is ready if at least one domain loaded successfully
+    _state["ready"] = bool(_state["domain_configs"])
+    logger.info(
+        "Startup complete — domains ready: %s",
+        list(_state["domain_configs"].keys()) or "none",
+    )
 
     yield
 
-    logger.info("Ergo.ai shutting down.")
+    logger.info("Optide V2 shutting down.")
 
 
-# ---------------------------------------------------------------------------
+def _load_domain(domain_id: str) -> bool:
+    """Load config, dataset, and model for one domain. Returns True on success."""
+    config_path = CONFIGS_DIR / f"{domain_id}_config.json"
+    if not config_path.exists():
+        logger.warning("Config file missing: %s", config_path)
+        return False
+
+    try:
+        cfg = load_domain_config(config_path)
+    except Exception as exc:
+        logger.error("Failed to load config %s: %s", config_path, exc)
+        return False
+
+    warnings = validate_domain_config(cfg)
+    for w in warnings:
+        logger.warning("[%s] config warning: %s", domain_id, w)
+
+    # Load dataset
+    data_path = Path(cfg.dataset_path)
+    if not data_path.exists():
+        logger.warning("[%s] Dataset not found: %s — domain will be config-only.", domain_id, data_path)
+        _state["domain_configs"][domain_id] = cfg
+        return True
+
+    try:
+        predictor_for_load = CancellationPredictor(domain_config=cfg)
+        df = predictor_for_load.load_raw()
+        time_s = build_time_column(df, cfg)
+        if time_s.notna().any():
+            df["_time"] = time_s
+        df = add_uid_column(df, cfg)
+        _state["datasets"][domain_id] = df
+        logger.info("[%s] Dataset loaded — %d rows", domain_id, len(df))
+    except Exception as exc:
+        logger.error("[%s] Dataset load failed: %s", domain_id, exc)
+        _state["domain_configs"][domain_id] = cfg
+        return True
+
+    # Load pre-trained model
+    model_path = f"model_{domain_id}.pkl"
+    if os.path.exists(model_path):
+        try:
+            predictor = joblib.load(model_path)
+            logger.info("[%s] Loaded model from %s", domain_id, model_path)
+        except Exception as exc:
+            logger.error("[%s] Could not load %s: %s", domain_id, model_path, exc)
+            predictor = None
+    else:
+        logger.warning(
+            "[%s] model_%s.pkl not found — run `python train_model.py %s` first.",
+            domain_id, domain_id, domain_id,
+        )
+        predictor = None
+
+    _state["domain_configs"][domain_id] = cfg
+    if predictor is not None:
+        _state["predictors"][domain_id] = predictor
+        _state["engines"][domain_id]    = DecisionEngine()
+        _state["model_metrics"][domain_id] = {
+            "cv_metrics": predictor.cv_metrics,
+            "mean_auc":   round(float(np.mean([m["auc"]   for m in predictor.cv_metrics])), 4) if predictor.cv_metrics else 0.0,
+            "mean_brier": round(float(np.mean([m["brier"] for m in predictor.cv_metrics])), 4) if predictor.cv_metrics else 0.0,
+        }
+
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # FastAPI app
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Ergo.ai — Decision Intelligence Engine",
-    description=(
-        "Hotel booking demand optimisation via calibrated LightGBM + MILP (HiGHS). "
-        "Endpoints: /health, /predict, /optimize, /backtest, /sensitivity, /report"
-    ),
-    version="1.0.0",
+    title="Optide — Decision Intelligence Engine",
+    description="Scope-driven booking optimisation: LightGBM + MILP (HiGHS). V2.",
+    version="2.0.0",
     lifespan=lifespan,
 )
-
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -145,631 +212,653 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class NgrokHeaderMiddleware(BaseHTTPMiddleware):
+
+class _NgrokMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
         response.headers["ngrok-skip-browser-warning"] = "true"
         return response
 
-app.add_middleware(NgrokHeaderMiddleware)
+
+app.add_middleware(_NgrokMiddleware)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Guards
+# ────────────────────────────────────────────────────────────────────────────
 
 def _require_ready() -> None:
     if not _state.get("ready"):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Model not ready. "
-                "Place hotel_bookings.csv in the working directory and restart the server."
-            ),
+            detail="No domains ready. Place CSV + config in working directory and restart.",
         )
 
 
-# ---------------------------------------------------------------------------
+def _require_domain(domain_id: str) -> DomainConfig:
+    cfg = _state["domain_configs"].get(domain_id)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"Domain '{domain_id}' not found.")
+    return cfg
+
+
+def _require_predictor(domain_id: str) -> tuple[CancellationPredictor, DecisionEngine]:
+    predictor = _state["predictors"].get(domain_id)
+    engine    = _state["engines"].get(domain_id)
+    if predictor is None or engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model for domain '{domain_id}' not loaded. Run `python train_model.py {domain_id}` first.",
+        )
+    return predictor, engine
+
+
+def _require_scope(scope_id: str) -> Scope:
+    sm: ScopeManager = _state["scope_manager"]
+    try:
+        return sm.get_scope(scope_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Scope '{scope_id}' not found.")
+
+
+def _require_locked(scope: Scope) -> None:
+    if scope.status != "locked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error":      "scope_not_locked",
+                "message_en": "Scope must be locked. Run POST /optimize first.",
+                "message_it": "Lo scope deve essere bloccato. Eseguire prima POST /optimize.",
+            },
+        )
+
+
+def _scope_df(scope: Scope, domain_id: str) -> pd.DataFrame:
+    """Return the subset of the domain dataset matching the scope UIDs."""
+    df_full = _state["datasets"].get(domain_id)
+    if df_full is None:
+        raise HTTPException(status_code=503, detail=f"Dataset for domain '{domain_id}' not loaded.")
+    if "_uid" in df_full.columns:
+        df = df_full[df_full["_uid"].isin(scope.selected_uids)].copy().reset_index(drop=True)
+    else:
+        df = df_full.copy()
+    if len(df) == 0:
+        raise HTTPException(status_code=422, detail="Scope UIDs not found in dataset.")
+    return df
+
+
+def _outcome_available(df: pd.DataFrame, cfg: DomainConfig) -> bool:
+    target = cfg.ml_target_column
+    if not target:
+        return False
+    if target not in df.columns:
+        return False
+    return not df[target].isna().any()
+
+
+def _realized_profit(
+    decisions: np.ndarray,
+    y_true: np.ndarray,
+    gross_rev: np.ndarray,
+    penalty: float,
+) -> float:
+    total = 0.0
+    for i, dec in enumerate(decisions):
+        if dec == 1:
+            total += float(gross_rev[i]) if y_true[i] == 0 else -penalty
+    return total
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Pydantic schemas
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
-class BookingFeatures(BaseModel):
-    """Features available at booking time (no post-facto information)."""
-
-    hotel: str                        = "City Hotel"
-    lead_time: float                  = 30
-    arrival_date_year: int            = 2016
-    arrival_date_month: str           = "July"
-    arrival_date_week_number: int     = 27
-    arrival_date_day_of_month: int    = 1
-    stays_in_weekend_nights: float    = 1
-    stays_in_week_nights: float       = 2
-    adults: float                     = 2
-    children: float                   = 0
-    babies: float                     = 0
-    meal: str                         = "BB"
-    country: str                      = "PRT"
-    market_segment: str               = "Online TA"
-    distribution_channel: str         = "TA/TO"
-    is_repeated_guest: int            = 0
-    previous_cancellations: float     = 0
-    previous_bookings_not_canceled: float = 0
-    reserved_room_type: str           = "A"
-    booking_changes: float            = 0
-    deposit_type: str                 = "No Deposit"
-    agent: float                      = 0
-    company: float                    = 0
-    days_in_waiting_list: float       = 0
-    customer_type: str                = "Transient"
-    adr: float                        = 80.0
-    required_car_parking_spaces: float = 0
-    total_of_special_requests: float  = 0
-    total_nights: Optional[float]     = None  # computed if absent
-
-    model_config = {"extra": "allow"}
+class SelectionRule(BaseModel):
+    type: str       = "random"
+    n: int          = Field(default=100, ge=1, le=10_000)
+    start_date: Optional[str] = None
+    end_date:   Optional[str] = None
 
 
-class PredictRequest(BaseModel):
-    bookings: list[BookingFeatures] = Field(..., min_length=1)
+class ScopeParams(BaseModel):
+    cancellation_penalty: float = Field(default=50.0,  ge=0)
+    capacity:             float = Field(default=100.0, ge=1)
+    lambda_risk:          float = Field(default=0.0,   ge=0)
 
 
-class PredictResponse(BaseModel):
-    n_bookings: int
-    predictions: list[dict[str, Any]]
+class CreateScopeRequest(BaseModel):
+    domain_id:      str
+    selection_rule: SelectionRule = SelectionRule()
+    params:         ScopeParams   = ScopeParams()
+    seed:           int           = 42
+
+
+class CloneScopeRequest(BaseModel):
+    scope_id:   str
+    new_params: dict = {}
 
 
 class OptimizeRequest(BaseModel):
-    bookings: list[BookingFeatures] = Field(default=[], description="Ignored: dataset sample is used instead")
-    cancellation_penalty: float     = 50.0
-    capacity: float                 = 100.0
-    lambda_risk: float              = 1.0
-    n_samples: int                  = Field(default=100, ge=10, le=500, description="Number of bookings to sample from the dataset")
-
-
-class OptimizeResponse(BaseModel):
-    n_bookings: int
-    n_accepted: int
-    n_rejected: int
-    total_expected_revenue: float
-    total_realized_profit: float
-    expected_occupancy: float
-    solver_status: str
-    params_used: dict[str, float]
-    decisions: list[dict[str, Any]]
+    scope_id:             str
+    cancellation_penalty: Optional[float] = None  # overrides scope.params_snapshot
+    capacity:             Optional[float] = None
+    lambda_risk:          Optional[float] = None
 
 
 class BacktestRequest(BaseModel):
-    n_splits: int               = Field(default=5,    ge=2,  le=10)
-    n_samples: int              = Field(default=100,  ge=10, le=500, description="Bookings sampled per time window")
-    capacity: float             = Field(default=100.0, ge=1)
-    cancellation_penalty: float = Field(default=50.0, ge=0)
-    lambda_risk: float          = Field(default=1.0,  ge=0)
+    scope_id:          str
+    n_splits:          int = Field(default=5,   ge=2, le=10)
+    n_samples_per_fold:int = Field(default=100, ge=10, le=1000)
 
 
 class SensitivityRequest(BaseModel):
-    capacity: float            = Field(default=100.0, ge=1)
-    base_penalty: float        = Field(default=50.0,  ge=0)
-    base_lambda: float         = Field(default=1.0,   ge=0)
-    n_sample: int              = Field(default=500,   ge=50, le=5000,
-                                       description="Bookings sampled from dataset for speed")
+    scope_id:    Optional[str]   = None
+    domain_id:   Optional[str]   = None
+    capacity:    float           = Field(default=100.0, ge=1)
+    base_penalty:float           = Field(default=50.0,  ge=0)
+    base_lambda: float           = Field(default=0.0,   ge=0)
+    n_sample:    int             = Field(default=500,   ge=50, le=5000)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _bookings_to_df(bookings: list[BookingFeatures]) -> pd.DataFrame:
-    """Convert a list of Pydantic booking models to a pandas DataFrame."""
-    rows = []
-    for b in bookings:
-        d = b.model_dump()
-        if d.get("total_nights") is None:
-            d["total_nights"] = max(
-                1.0,
-                float(d.get("stays_in_weekend_nights", 0) or 0)
-                + float(d.get("stays_in_week_nights",  0) or 0),
-            )
-        rows.append(d)
-    return pd.DataFrame(rows)
+class ReportRequest(BaseModel):
+    scope_id: str
+    lang:     str = "en"
 
 
-def _opt_result_to_dict(
-    result: OptimizationResult,
-    y_true: np.ndarray | None = None,
-    gross_rev: np.ndarray | None = None,
-    penalty: float = 0.0,
-) -> list[dict[str, Any]]:
-    rows = []
-    for i in range(len(result.decisions)):
-        accepted = bool(result.decisions[i])
-        if y_true is not None and gross_rev is not None and accepted:
-            realized = float(gross_rev[i]) if y_true[i] == 0 else -penalty
-        else:
-            realized = 0.0
-        rows.append({
-            "booking_id":       i,
-            "accept":           accepted,
-            "p_cancel":         round(float(result.p_cancel[i]), 4),
-            "p_no_cancel":      round(float(1.0 - result.p_cancel[i]), 4),
-            "expected_value":   round(float(result.expected_values[i]), 2),
-            "gross_revenue":    round(float(result.gross_revenues[i]), 2),
-            "realized_profit":  round(realized, 2),
-            "risk_label":       (
-                "high"   if result.p_cancel[i] > 0.60
-                else "medium" if result.p_cancel[i] > 0.35
-                else "low"
-            ),
-        })
-    return rows
+class HistoricalBaselineRequest(BaseModel):
+    scope_id:             str
+    cancellation_penalty: Optional[float] = None
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 # GET /health
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.get("/health", tags=["system"], summary="Liveness and readiness check")
+@app.get("/health", tags=["system"])
 async def health() -> dict[str, Any]:
-    """Return the service status and current model metrics."""
-    metrics = _state.get("model_metrics") or {}
+    domains_ready = list(_state["predictors"].keys())
+    domains_config_only = [
+        d for d in _state["domain_configs"] if d not in _state["predictors"]
+    ]
     return {
-        "status":         "ready" if _state.get("ready") else "not_ready",
-        "dataset_loaded": _state.get("ready", False),
-        "model_metrics":  metrics,
-        "dataset_rows":   len(_state["df"]) if _state.get("ready") else None,
+        "status":             "ready" if _state.get("ready") else "not_ready",
+        "domains_ready":      domains_ready,
+        "domains_config_only":domains_config_only,
+        "model_metrics":      _state.get("model_metrics", {}),
+        "n_scopes":           len(_state["scope_manager"]._scopes) if _state["scope_manager"] else 0,
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /predict
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# GET /domain/list
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.post(
-    "/predict",
-    response_model=PredictResponse,
-    tags=["ml"],
-    summary="Predict cancellation probability for each booking [Layer 1]",
-)
-async def predict(request: PredictRequest) -> PredictResponse:
-    """Return P(cancel) and risk label for each supplied booking."""
+@app.get("/domain/list", tags=["domain"])
+async def domain_list() -> dict[str, Any]:
+    """List all domain configs discovered at startup."""
+    result = []
+    for domain_id, cfg in _state["domain_configs"].items():
+        result.append({
+            "domain_id":   domain_id,
+            "domain_name": cfg.domain_name,
+            "model_ready": domain_id in _state["predictors"],
+            "dataset_rows": len(_state["datasets"].get(domain_id, [])) or None,
+            "revenue_formula": cfg.revenue_formula,
+            "ml_target_column": cfg.ml_target_column,
+        })
+    return {"domains": result}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# GET /domain/templates
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/domain/templates", tags=["domain"])
+async def domain_templates() -> dict[str, Any]:
+    """Return example config templates for hotel and logistics domains."""
+    return {
+        "templates": [
+            {
+                "domain_id":   "hotel_v1",
+                "domain_name": "Hotel Booking Demand",
+                "revenue_formula": "adr*(stays_in_weekend_nights+stays_in_week_nights)",
+                "ml_target_column": "is_canceled",
+                "dataset_path": "hotel_bookings.csv",
+            },
+            {
+                "domain_id":   "logistics_v1",
+                "domain_name": "Logistics Route Acceptance",
+                "revenue_formula": "base_rate * weight_kg * distance_km",
+                "ml_target_column": "cancelled",
+                "dataset_path": "logistics_data.csv",
+            },
+        ]
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# POST /scope/create
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/scope/create", tags=["scope"])
+async def scope_create(request: CreateScopeRequest) -> dict[str, Any]:
+    """Create a new draft scope for a domain."""
     _require_ready()
+    cfg = _require_domain(request.domain_id)
 
-    predictor: CancellationPredictor = _state["predictor"]
-    df = _bookings_to_df(request.bookings)
+    df_full = _state["datasets"].get(request.domain_id)
+    if df_full is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Dataset for domain '{request.domain_id}' not loaded.",
+        )
 
-    try:
-        p_cancel = predictor.predict_from_raw(df)
-    except Exception as exc:
-        logger.exception("Prediction failed")
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    sm: ScopeManager = _state["scope_manager"]
+    params_dict = request.params.model_dump()
 
-    predictions = [
-        {
-            "booking_id":  i,
-            "p_cancel":    round(float(p), 4),
-            "p_no_cancel": round(float(1.0 - p), 4),
-            "risk_label":  "high" if p > 0.60 else "medium" if p > 0.35 else "low",
-        }
-        for i, p in enumerate(p_cancel)
-    ]
-
-    return PredictResponse(n_bookings=len(predictions), predictions=predictions)
-
-
-# ---------------------------------------------------------------------------
-# POST /optimize
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/optimize",
-    response_model=OptimizeResponse,
-    tags=["optimization"],
-    summary="MILP booking-acceptance optimisation [Layer 2]",
-)
-async def optimize(request: OptimizeRequest) -> OptimizeResponse:
-    """
-    Run the HiGHS MILP optimiser to maximise expected revenue subject
-    to capacity constraints.  Returns an accept/reject decision per booking.
-    """
-    _require_ready()
-
-    print(f"PARAMETRI RICEVUTI: capacity={request.capacity}, cancellation_penalty={request.cancellation_penalty}, lambda_risk={request.lambda_risk}, n_samples={request.n_samples}", flush=True)
-    logger.info(
-        "/optimize called — capacity=%.0f  penalty=%.2f  lambda_risk=%.2f  n_samples=%d",
-        request.capacity, request.cancellation_penalty, request.lambda_risk, request.n_samples,
+    scope = sm.create_scope(
+        domain_config_id=request.domain_id,
+        params=params_dict,
+        selection_rule=request.selection_rule.model_dump(),
+        df=df_full,
+        cfg=cfg,
+        seed=request.seed,
     )
 
-    predictor: CancellationPredictor = _state["predictor"]
-    engine:    DecisionEngine        = _state["engine"]
-    df_full:   pd.DataFrame          = _state["df"]
+    return {
+        "scope_id":  scope.scope_id,
+        "status":    scope.status,
+        "n_uids":    scope.n_uids,
+        "domain_id": scope.domain_config_id,
+        "created_at":scope.created_at,
+        "params_snapshot": scope.params_snapshot,
+    }
 
-    # Sample n_samples real bookings from the loaded dataset (bookings from frontend are ignored)
-    n_sample = min(request.n_samples, len(df_full))
-    rng = np.random.default_rng(RANDOM_SEED)
-    idx = rng.choice(len(df_full), size=n_sample, replace=False)
-    df = df_full.iloc[idx].copy().reset_index(drop=True)
+
+# ────────────────────────────────────────────────────────────────────────────
+# POST /scope/clone
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/scope/clone", tags=["scope"])
+async def scope_clone(request: CloneScopeRequest) -> dict[str, Any]:
+    """Clone an existing scope with new parameters (creates a fresh draft)."""
+    _require_ready()
+    scope = _require_scope(request.scope_id)
+    sm: ScopeManager = _state["scope_manager"]
+    new_scope, warning = sm.clone_scope(request.scope_id, request.new_params)
+
+    return {
+        "new_scope_id":    new_scope.scope_id,
+        "original_scope_id": request.scope_id,
+        "status":          new_scope.status,
+        "n_uids":          new_scope.n_uids,
+        "params_snapshot": new_scope.params_snapshot,
+        "warning":         warning,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# GET /scope/list
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/scope/list", tags=["scope"])
+async def scope_list() -> dict[str, Any]:
+    """List all scopes."""
+    sm: ScopeManager = _state["scope_manager"]
+    return {"scopes": sm.list_scopes()}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# GET /scope/{scope_id}
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get("/scope/{scope_id}", tags=["scope"])
+async def scope_get(scope_id: str) -> dict[str, Any]:
+    """Return scope metadata."""
+    scope = _require_scope(scope_id)
+    return scope.to_dict()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# POST /optimize
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/optimize", tags=["optimization"])
+async def optimize(request: OptimizeRequest) -> dict[str, Any]:
+    """
+    Run MILP optimisation on the scope's selected bookings.
+    Locks the scope on success (scope.status → 'locked').
+    """
+    _require_ready()
+    scope     = _require_scope(request.scope_id)
+    domain_id = scope.domain_config_id
+    cfg       = _require_domain(domain_id)
+    predictor, engine = _require_predictor(domain_id)
+
+    # Resolve params: request overrides > scope snapshot > domain defaults
+    snap    = scope.params_snapshot
+    penalty = request.cancellation_penalty if request.cancellation_penalty is not None \
+              else snap.get("cancellation_penalty", cfg.cancellation_penalty_default)
+    capacity = request.capacity if request.capacity is not None \
+               else snap.get("capacity", 100.0)
+    lambda_risk = request.lambda_risk if request.lambda_risk is not None \
+                  else snap.get("lambda_risk", cfg.lambda_risk_default)
+
+    params = OptimizationParams(
+        capacity=capacity,
+        cancellation_penalty=penalty,
+        lambda_risk=lambda_risk,
+    )
+
+    df = _scope_df(scope, domain_id)
+    outcome_avail = _outcome_available(df, cfg)
+
+    logger.info(
+        "/optimize scope=%s domain=%s n=%d capacity=%.0f penalty=%.2f lambda=%.2f",
+        scope.scope_id, domain_id, len(df), capacity, penalty, lambda_risk,
+    )
 
     try:
         p_cancel = predictor.predict_proba(df)
     except Exception as exc:
-        logger.exception("Prediction step failed inside /optimize")
+        logger.exception("Prediction failed")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    params = OptimizationParams(
-        capacity=request.capacity,
-        cancellation_penalty=request.cancellation_penalty,
-        lambda_risk=request.lambda_risk,
-    )
+    uids = df["_uid"].tolist() if "_uid" in df.columns else [str(i) for i in range(len(df))]
 
     try:
-        result: OptimizationResult = engine.optimize(df, p_cancel, params)
+        result: OptimizationResult = engine.optimize(df, p_cancel, params, cfg=cfg, uids=uids)
     except Exception as exc:
         logger.exception("Optimisation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # ── Realized profit using actual is_canceled outcomes ──────────────────
-    adr_arr = df["adr"].fillna(0).values.astype(np.float64)
-    if "total_nights" in df.columns:
-        nights_arr = df["total_nights"].fillna(0).values.astype(np.float64)
-    elif "stays_in_week_nights" in df.columns:
-        nights_arr = (
-            df["stays_in_weekend_nights"].fillna(0)
-            + df["stays_in_week_nights"].fillna(0)
-        ).values.astype(np.float64)
-    else:
-        nights_arr = np.ones(len(df), dtype=np.float64)
-    nights_arr = np.maximum(nights_arr, 1.0)
-    gross_rev_arr = adr_arr * nights_arr
+    # Realized profit (only if outcomes available)
+    gross_rev = evaluate_revenue(df, cfg.revenue_formula)
+    total_realized: float | None = None
+    baseline_realized: float | None = None
 
-    y_true_arr = (
-        df["is_canceled"].values.astype(int)
-        if "is_canceled" in df.columns
-        else np.zeros(len(df), dtype=int)
-    )
+    if outcome_avail:
+        y_true = df[cfg.ml_target_column].values.astype(int)
+        total_realized   = round(_realized_profit(result.decisions, y_true, gross_rev, penalty), 2)
+        baseline_realized = round(_realized_profit(
+            np.ones(len(df), dtype=int), y_true, gross_rev, penalty
+        ), 2)
+        diff = total_realized - baseline_realized
+        logger.info(
+            "[scope=%s] AI realized=%.0f  Baseline=%.0f  delta=%+.0f (%s)",
+            scope.scope_id, total_realized, baseline_realized, diff,
+            "AI wins" if diff >= 0 else "Baseline wins",
+        )
 
-    # AI realized profit: only accepted bookings count
-    total_realized_profit = 0.0
-    for i, dec in enumerate(result.decisions):
-        if dec == 1:
-            if y_true_arr[i] == 0:
-                total_realized_profit += float(gross_rev_arr[i])
-            else:
-                total_realized_profit -= request.cancellation_penalty
+    # Charts
+    p_cancel_list = p_cancel.tolist()
+    decisions_list = result.decisions.tolist()
+    charts: dict[str, str] = {}
+    try:
+        charts["profit_composition"] = profit_composition_chart(
+            result.n_accepted, result.n_rejected,
+            result.total_expected_revenue, total_realized,
+        )
+        charts["capacity_utilization"] = capacity_utilization_chart(result.n_accepted, capacity)
+        charts["decision_distribution"] = decision_distribution_chart(p_cancel_list, decisions_list)
+        if outcome_avail:
+            expected_list = result.expected_values.tolist()
+            realized_list = [
+                float(gross_rev[i]) if (result.decisions[i] == 1 and df[cfg.ml_target_column].iloc[i] == 0)
+                else (-penalty if result.decisions[i] == 1 else 0.0)
+                for i in range(len(df))
+            ]
+            charts["expected_vs_realized"] = expected_vs_realized_chart(
+                expected_list[:50], realized_list[:50], outcome_avail
+            )
+    except Exception as exc:
+        logger.warning("Chart generation failed: %s", exc)
 
-    # Baseline realized profit: accept-all on same sample
-    baseline_realized_profit = 0.0
+    # Per-booking decisions list
+    decisions_out = []
     for i in range(len(df)):
-        if y_true_arr[i] == 0:
-            baseline_realized_profit += float(gross_rev_arr[i])
-        else:
-            baseline_realized_profit -= request.cancellation_penalty
+        accepted = bool(result.decisions[i])
+        real_val: float | None = None
+        if outcome_avail:
+            y_i = int(df[cfg.ml_target_column].iloc[i])
+            real_val = round(float(gross_rev[i]) if (accepted and y_i == 0)
+                             else (-penalty if accepted else 0.0), 2)
+        decisions_out.append({
+            "uid":            uids[i],
+            "accept":         accepted,
+            "p_cancel":       round(float(p_cancel[i]), 4),
+            "expected_value": round(float(result.expected_values[i]), 2),
+            "gross_revenue":  round(float(gross_rev[i]), 2),
+            "realized_profit": real_val,
+            "risk_label": (
+                "high"   if p_cancel[i] > 0.60 else
+                "medium" if p_cancel[i] > 0.35 else "low"
+            ),
+        })
 
-    diff = total_realized_profit - baseline_realized_profit
-    print(
-        f"\n[AI vs Baseline — same {len(df)} bookings]\n"
-        f"  AI       : accepted={result.n_accepted:>4}/{len(df)}  "
-        f"realized_profit={total_realized_profit:>10,.2f}\n"
-        f"  Baseline : accepted={len(df):>4}/{len(df)}  "
-        f"realized_profit={baseline_realized_profit:>10,.2f}\n"
-        f"  Diff     : {diff:>+10,.2f}  "
-        f"({'AI wins' if diff >= 0 else 'Baseline wins'})\n"
-        f"  [actual cancellations in sample: {int(y_true_arr.sum())}/{len(df)}]",
-        flush=True,
-    )
+    # Lock scope
+    sm: ScopeManager = _state["scope_manager"]
+    sm.lock_scope(scope.scope_id)
 
-    # Cache for report
-    _state["last_optimize"] = {
+    # Cache result snapshot
+    snapshot = {
+        "scope_id":              scope.scope_id,
+        "domain_id":             domain_id,
+        "n_accepted":            result.n_accepted,
+        "n_rejected":            result.n_rejected,
+        "total_expected_revenue":round(result.total_expected_revenue, 2),
+        "total_realized_profit": total_realized,
+        "baseline_realized_profit": baseline_realized,
+        "expected_occupancy":    round(result.expected_occupancy, 2),
+        "solver_status":         result.solver_status,
+        "lambda_status":         result.lambda_status,
+        "outcome_available":     outcome_avail,
+        "charts":                charts,
+        "params_used": {
+            "capacity":             capacity,
+            "cancellation_penalty": penalty,
+            "lambda_risk":          lambda_risk,
+        },
+    }
+    _state["results"][scope.scope_id] = snapshot
+
+    return {
+        "scope_id":               scope.scope_id,
+        "scope_status":           "locked",
+        "n_bookings":             len(df),
         "n_accepted":             result.n_accepted,
         "n_rejected":             result.n_rejected,
         "total_expected_revenue": round(result.total_expected_revenue, 2),
+        "total_realized_profit":  total_realized,
+        "baseline_realized_profit": baseline_realized,
         "expected_occupancy":     round(result.expected_occupancy, 2),
         "solver_status":          result.solver_status,
-    }
-
-    return OptimizeResponse(
-        n_bookings=len(df),
-        n_accepted=result.n_accepted,
-        n_rejected=result.n_rejected,
-        total_expected_revenue=round(result.total_expected_revenue, 2),
-        total_realized_profit=round(total_realized_profit, 2),
-        expected_occupancy=round(result.expected_occupancy, 2),
-        solver_status=result.solver_status,
-        params_used={
-            "capacity":             request.capacity,
-            "cancellation_penalty": request.cancellation_penalty,
-            "lambda_risk":          request.lambda_risk,
-        },
-        decisions=_opt_result_to_dict(
-            result,
-            y_true=y_true_arr,
-            gross_rev=gross_rev_arr,
-            penalty=request.cancellation_penalty,
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# GET /dataset_info
-# ---------------------------------------------------------------------------
-
-@app.get("/dataset_info", tags=["system"], summary="Info sul dataset caricato")
-async def dataset_info() -> dict[str, Any]:
-    """Restituisce statistiche sul dataset hotel_bookings caricato in memoria."""
-    _require_ready()
-
-    df: pd.DataFrame = _state["df"]
-
-    # Date range
-    date_min = str(df["arrival_date"].min().date()) if "arrival_date" in df.columns else None
-    date_max = str(df["arrival_date"].max().date()) if "arrival_date" in df.columns else None
-
-    # Distribuzione per hotel
-    hotel_dist = df["hotel"].value_counts().to_dict() if "hotel" in df.columns else {}
-
-    # Distribuzione per market_segment
-    segment_dist = (
-        df["market_segment"].value_counts().to_dict()
-        if "market_segment" in df.columns else {}
-    )
-
-    return {
-        "total_rows":        len(df),
-        "date_range":        {"min": date_min, "max": date_max},
-        "hotel_distribution":   hotel_dist,
-        "segment_distribution": segment_dist,
-        "n_samples_range":   {"min": 10, "max": 500, "default": 100},
+        "lambda_status":          result.lambda_status,
+        "outcome_available":      outcome_avail,
+        "params_used":            snapshot["params_used"],
+        "charts":                 charts,
+        "decisions":              decisions_out,
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /historical_baseline
-# ---------------------------------------------------------------------------
-
-class HistoricalBaselineRequest(BaseModel):
-    n_samples: int            = Field(default=100, ge=10, le=500)
-    cancellation_penalty: float = Field(default=50.0, ge=0)
-
-
-@app.post(
-    "/historical_baseline",
-    tags=["analysis"],
-    summary="Simulate accept-all historical baseline on a random sample",
-)
-async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, Any]:
-    """
-    Accept all n_samples bookings without optimisation (historical baseline).
-    Uses actual is_canceled outcomes to compute realised profit/loss.
-    """
-    _require_ready()
-
-    predictor: CancellationPredictor = _state["predictor"]
-    df_full:   pd.DataFrame          = _state["df"]
-
-    # Same fixed seed as /optimize for consistency
-    n = min(request.n_samples, len(df_full))
-    rng = np.random.default_rng(RANDOM_SEED)
-    idx = rng.choice(len(df_full), size=n, replace=False)
-    df = df_full.iloc[idx].copy().reset_index(drop=True)
-
-    # Gross revenue — same logic as /optimize for consistency
-    adr = df["adr"].fillna(0).values.astype(np.float64)
-    if "total_nights" in df.columns:
-        nights = df["total_nights"].fillna(0).values.astype(np.float64)
-    elif "stays_in_week_nights" in df.columns:
-        nights = (
-            df["stays_in_weekend_nights"].fillna(0)
-            + df["stays_in_week_nights"].fillna(0)
-        ).values.astype(np.float64)
-    else:
-        nights = np.ones(n, dtype=np.float64)
-    nights = np.maximum(nights, 1.0)
-    gross_rev = adr * nights
-
-    # Realised outcome using actual is_canceled
-    y_true = (
-        df["is_canceled"].values.astype(int)
-        if "is_canceled" in df.columns
-        else np.zeros(n, dtype=int)
-    )
-    realized_cancellations = int(y_true.sum())
-
-    # Baseline: accept ALL n bookings
-    realized_profit = 0.0
-    for i in range(n):
-        if y_true[i] == 0:
-            realized_profit += float(gross_rev[i])
-        else:
-            realized_profit -= request.cancellation_penalty
-
-    print(
-        f"\n[historical_baseline — {n} bookings, all accepted]\n"
-        f"  cancellations : {realized_cancellations}/{n}\n"
-        f"  gross_revenue : {float(gross_rev.sum()):>10,.2f}\n"
-        f"  realized_profit: {realized_profit:>10,.2f}  "
-        f"(losses from cancellations: {realized_cancellations} × {request.cancellation_penalty} "
-        f"= {realized_cancellations * request.cancellation_penalty:,.2f})",
-        flush=True,
-    )
-
-    return {
-        "bookings_accepted":         n,
-        "total_realized_profit":     round(realized_profit, 2),
-        "total_gross_revenue":       round(float(gross_rev.sum()), 2),
-        "realized_cancellations":    realized_cancellations,
-        "cancellation_penalty_used": request.cancellation_penalty,
-    }
-
-
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 # POST /backtest
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.post(
-    "/backtest",
-    tags=["backtesting"],
-    summary="Rolling walk-forward backtest: AI vs accept-all baseline [Layer 3]",
-)
+@app.post("/backtest", tags=["backtesting"])
 async def backtest(request: BacktestRequest) -> dict[str, Any]:
     """
-    Temporal backtest: AI strategy vs accept-all baseline.
-
-    The dataset is split into n_splits chronological windows.
-    For each window, n_samples bookings are sampled, the pre-trained model
-    predicts P(cancel), the MILP optimiser makes accept/reject decisions,
-    and realised revenue is computed from actual is_canceled outcomes.
+    Rolling walk-forward backtest: AI strategy vs accept-all baseline.
+    Returns 409 if the scope is not locked.
+    Returns 422 if no ground-truth outcomes are available.
     """
     _require_ready()
+    scope = _require_scope(request.scope_id)
+    _require_locked(scope)
 
-    print(
-        f"BACKTEST RICEVUTO: n_splits={request.n_splits}  n_samples={request.n_samples}"
-        f"  capacity={request.capacity}  cancellation_penalty={request.cancellation_penalty}"
-        f"  lambda_risk={request.lambda_risk}",
-        flush=True,
+    domain_id = scope.domain_config_id
+    cfg       = _require_domain(domain_id)
+    predictor, engine = _require_predictor(domain_id)
+
+    df_full = _state["datasets"].get(domain_id)
+    if df_full is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded.")
+
+    outcome_avail = _outcome_available(
+        df_full[df_full["_uid"].isin(scope.selected_uids)] if "_uid" in df_full.columns else df_full,
+        cfg,
     )
-    logger.info(
-        "/backtest called — n_splits=%d  n_samples=%d  capacity=%.0f  penalty=%.2f  lambda=%.2f",
-        request.n_splits, request.n_samples,
-        request.capacity, request.cancellation_penalty, request.lambda_risk,
+    if not outcome_avail:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":      "outcome_not_available",
+                "message_en": "Backtesting requires real historical outcomes. "
+                              "Cannot run on data without ml_target_column.",
+                "message_it": "Il backtesting richiede outcome storici reali. "
+                              "Impossibile eseguire su dati senza ml_target_column.",
+            },
+        )
+
+    snap    = scope.params_snapshot
+    params  = OptimizationParams(
+        capacity=snap.get("capacity", 100.0),
+        cancellation_penalty=snap.get("cancellation_penalty", cfg.cancellation_penalty_default),
+        lambda_risk=snap.get("lambda_risk", cfg.lambda_risk_default),
     )
+    model_metrics = _state["model_metrics"].get(domain_id, {})
 
-    backtester: Backtester  = _state["backtester"]
-    df: pd.DataFrame        = _state["df"]
-    model_metrics: dict     = _state.get("model_metrics", {})
-
-    params = OptimizationParams(
-        capacity=request.capacity,
-        cancellation_penalty=request.cancellation_penalty,
-        lambda_risk=request.lambda_risk,
-    )
-
+    bt = Backtester(predictor, engine)
     try:
-        summary: BacktestSummary = backtester.run(
-            df,
+        summary = bt.run(
+            df_full,
             params,
+            cfg=cfg,
+            scope=scope,
+            outcome_available=True,
             n_splits=request.n_splits,
-            n_samples_per_fold=request.n_samples,
+            n_samples_per_fold=request.n_samples_per_fold,
             model_metrics=model_metrics,
         )
+    except ValueError as exc:
+        if "outcome_not_available" in str(exc):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Backtest failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # Cache for /report
-    _state["last_backtest"] = summary
+    sm: ScopeManager = _state["scope_manager"]
+    sm.mark_backtest_completed(scope.scope_id)
 
     result_dict = summary.to_dict()
+    _state["backtests"][scope.scope_id] = result_dict
 
-    return {
-        "n_splits":              result_dict["n_splits"],
-        "mean_auc":              result_dict["mean_auc"],
-        "mean_brier":            result_dict["mean_brier"],
-        "total_ai_revenue":      result_dict["total_ai_revenue"],
-        "total_baseline_revenue":result_dict["total_baseline_revenue"],
-        "total_improvement_pct": result_dict["total_improvement_pct"],
-        "params":                result_dict["params"],
-        "folds":                 result_dict["folds"],
-    }
+    return result_dict
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 # POST /sensitivity
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.post(
-    "/sensitivity",
-    tags=["analysis"],
-    summary="Sensitivity sweep over penalty (50–200%), capacity (±20%), lambda (0–3×)",
-)
+@app.post("/sensitivity", tags=["analysis"])
 async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
     """
-    Resample *n_sample* bookings from the loaded dataset, compute P(cancel)
-    once with the fully-trained model, then re-run the MILP optimiser across
-    a grid of parameter values.
-
-    Returns three sensitivity curves:
-    - ``penalty_sensitivity``   : cancellation penalty ×0.5 → ×2.0
-    - ``capacity_sensitivity``  : capacity ×0.8 → ×1.2
-    - ``lambda_sensitivity``    : lambda 0.0 → 3.0
+    Sensitivity sweep: penalty (50–200%), capacity (±20%), lambda (0–3×).
+    Can be called with scope_id (uses scope domain) or domain_id directly.
     """
     _require_ready()
 
-    print(f"PARAMETRI RICEVUTI: {request}", flush=True)
-    logger.info(
-        "/sensitivity called — capacity=%.0f  base_penalty=%.2f  base_lambda=%.2f  n_sample=%d",
-        request.capacity, request.base_penalty, request.base_lambda, request.n_sample,
-    )
+    # Resolve domain
+    if request.scope_id:
+        scope     = _require_scope(request.scope_id)
+        domain_id = scope.domain_config_id
+    elif request.domain_id:
+        domain_id = request.domain_id
+        scope     = None
+    else:
+        raise HTTPException(status_code=422, detail="Provide scope_id or domain_id.")
 
-    predictor: CancellationPredictor = _state["predictor"]
-    engine:    DecisionEngine        = _state["engine"]
-    df:        pd.DataFrame          = _state["df"]
+    cfg               = _require_domain(domain_id)
+    predictor, engine = _require_predictor(domain_id)
+    df_full           = _state["datasets"].get(domain_id)
+    if df_full is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded.")
 
-    # Random sample from training data (fixed seed → reproducible)
-    rng       = np.random.default_rng(RANDOM_SEED)
-    n_sample  = min(request.n_sample, len(df))
-    idx       = rng.choice(len(df), size=n_sample, replace=False)
-    df_sample = df.iloc[idx].copy().reset_index(drop=True)
+    # Sample from scope or full dataset
+    if scope is not None and "_uid" in df_full.columns:
+        df_base = df_full[df_full["_uid"].isin(scope.selected_uids)].copy()
+    else:
+        df_base = df_full.copy()
+
+    rng      = np.random.default_rng(RANDOM_SEED)
+    n_sample = min(request.n_sample, len(df_base))
+    idx      = rng.choice(len(df_base), size=n_sample, replace=False)
+    df_sample = df_base.iloc[idx].copy().reset_index(drop=True)
 
     try:
         p_cancel = predictor.predict_proba(df_sample)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    base_params = OptimizationParams(
-        capacity=request.capacity,
-        cancellation_penalty=request.base_penalty,
-        lambda_risk=request.base_lambda,
-    )
-
-    def _run_opt(params: OptimizationParams) -> dict[str, Any]:
-        r = engine.optimize(df_sample, p_cancel, params)
+    def _run(params: OptimizationParams) -> dict[str, Any]:
+        r = engine.optimize(df_sample, p_cancel, params, cfg=cfg)
         return {
             "total_expected_revenue": round(r.total_expected_revenue, 2),
             "n_accepted":             r.n_accepted,
             "expected_occupancy":     round(r.expected_occupancy, 2),
         }
 
-    # ── 1. Penalty sensitivity: 50% → 200% in 7 steps ──────────────────
-    penalty_mults = np.linspace(0.5, 2.0, 7)
-    penalty_sens  = []
-    for m in penalty_mults:
-        p     = OptimizationParams(
-            capacity=base_params.capacity,
-            cancellation_penalty=base_params.cancellation_penalty * float(m),
-            lambda_risk=base_params.lambda_risk,
-        )
-        entry = _run_opt(p)
+    # 1. Penalty sensitivity: ×0.5 → ×2.0 (7 steps)
+    penalty_sens = []
+    for m in np.linspace(0.5, 2.0, 7):
+        p    = request.base_penalty * float(m)
+        entry = _run(OptimizationParams(
+            capacity=request.capacity,
+            cancellation_penalty=p,
+            lambda_risk=request.base_lambda,
+        ))
         entry["penalty_multiplier"] = round(float(m), 4)
-        entry["penalty_value"]      = round(float(base_params.cancellation_penalty * m), 2)
+        entry["penalty_value"]      = round(p, 2)
         penalty_sens.append(entry)
 
-    # ── 2. Capacity sensitivity: ±20% in 9 steps ───────────────────────
-    cap_mults    = np.linspace(0.8, 1.2, 9)
-    capacity_sens = []
-    for m in cap_mults:
-        p     = OptimizationParams(
-            capacity=base_params.capacity * float(m),
-            cancellation_penalty=base_params.cancellation_penalty,
-            lambda_risk=base_params.lambda_risk,
-        )
-        entry = _run_opt(p)
+    # 2. Capacity sensitivity: ×0.8 → ×1.2 (9 steps)
+    cap_sens = []
+    for m in np.linspace(0.8, 1.2, 9):
+        c     = request.capacity * float(m)
+        entry = _run(OptimizationParams(
+            capacity=c,
+            cancellation_penalty=request.base_penalty,
+            lambda_risk=request.base_lambda,
+        ))
         entry["capacity_multiplier"] = round(float(m), 4)
-        entry["capacity_value"]      = round(float(base_params.capacity * m), 2)
-        capacity_sens.append(entry)
+        entry["capacity_value"]      = round(c, 2)
+        cap_sens.append(entry)
 
-    # ── 3. Lambda sensitivity: 0× → 3× in 7 steps ──────────────────────
-    lambdas      = np.linspace(0.0, 3.0, 7)
-    lambda_sens  = []
-    for lam in lambdas:
-        eff_lam = max(float(lam), 1e-4)  # avoid degenerate zero-capacity constraint
-        p       = OptimizationParams(
-            capacity=base_params.capacity,
-            cancellation_penalty=base_params.cancellation_penalty,
-            lambda_risk=eff_lam,
-        )
-        entry         = _run_opt(p)
+    # 3. Lambda sensitivity: 0 → 3 (7 steps)
+    lam_sens = []
+    for lam in np.linspace(0.0, 3.0, 7):
+        entry = _run(OptimizationParams(
+            capacity=request.capacity,
+            cancellation_penalty=request.base_penalty,
+            lambda_risk=float(lam),
+        ))
         entry["lambda"] = round(float(lam), 4)
-        lambda_sens.append(entry)
+        lam_sens.append(entry)
+
+    # Charts
+    charts: dict[str, str] = {}
+    try:
+        charts["penalty_sensitivity"]  = penalty_sensitivity_chart(penalty_sens)
+        charts["capacity_sensitivity"] = capacity_sensitivity_chart(cap_sens)
+    except Exception as exc:
+        logger.warning("Sensitivity chart failed: %s", exc)
 
     result = {
         "penalty_sensitivity":  penalty_sens,
-        "capacity_sensitivity": capacity_sens,
-        "lambda_sensitivity":   lambda_sens,
+        "capacity_sensitivity": cap_sens,
+        "lambda_sensitivity":   lam_sens,
+        "charts":               charts,
         "params": {
             "base_capacity": request.capacity,
             "base_penalty":  request.base_penalty,
@@ -778,69 +867,62 @@ async def sensitivity(request: SensitivityRequest) -> dict[str, Any]:
         },
     }
 
-    # Cache for /report
-    _state["last_sensitivity"] = result
+    cache_key = request.scope_id or request.domain_id or "global"
+    _state["sensitivities"][cache_key] = result
     return result
 
 
-# ---------------------------------------------------------------------------
-# GET /report
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# POST /report
+# ────────────────────────────────────────────────────────────────────────────
 
-@app.get(
+@app.post(
     "/report",
     tags=["reporting"],
-    summary="Download a PDF report in English (en) or Italian (it)",
     responses={200: {"content": {"application/pdf": {}}}},
 )
-async def report(
-    lang: str = Query(
-        default="en",
-        pattern="^(en|it)$",
-        description="Report language: 'en' (English) or 'it' (Italian)",
-    ),
-) -> Response:
+async def report(request: ReportRequest) -> Response:
     """
-    Generate and download a PDF report.
-
-    The report includes:
-    - Executive summary
-    - Layer-1 model CV metrics
-    - Layer-3 backtesting results (if ``/backtest`` was called)
-    - Layer-2 optimization snapshot (if ``/optimize`` was called)
-    - Sensitivity analysis (if ``/sensitivity`` was called)
-
-    Call ``/backtest`` and ``/sensitivity`` first to populate all report sections.
+    Generate and download a PDF report for a locked scope.
+    Returns 409 if the scope is not locked.
     """
     _require_ready()
+    scope = _require_scope(request.scope_id)
+    _require_locked(scope)
 
-    model_metrics  = _state.get("model_metrics", {})
-    last_backtest  = _state.get("last_backtest")
-    last_sensitivity = _state.get("last_sensitivity")
-    last_optimize  = _state.get("last_optimize")
+    domain_id = scope.domain_config_id
+    cfg       = _require_domain(domain_id)
 
-    # Convert BacktestSummary dataclass → dict for the report generator
-    bt_dict: dict[str, Any] | None = None
-    if last_backtest is not None:
-        bt_dict = (
-            last_backtest.to_dict()
-            if isinstance(last_backtest, BacktestSummary)
-            else last_backtest
+    lang            = request.lang if request.lang in ("en", "it") else "en"
+    model_metrics   = _state["model_metrics"].get(domain_id, {})
+    opt_snapshot    = _state["results"].get(scope.scope_id)
+    bt_dict         = _state["backtests"].get(scope.scope_id)
+    sensitivity     = _state["sensitivities"].get(scope.scope_id) or \
+                      _state["sensitivities"].get(domain_id)
+
+    if opt_snapshot is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No optimization result cached for this scope. Run /optimize first.",
         )
+
+    outcome_avail = opt_snapshot.get("outcome_available", True)
 
     try:
         pdf_bytes = generate_report(
             lang=lang,
             model_metrics=model_metrics,
             backtest_summary=bt_dict,
-            sensitivity_results=last_sensitivity,
-            optimization_snapshot=last_optimize,
+            sensitivity_results=sensitivity,
+            optimization_snapshot=opt_snapshot,
+            scope_dict=scope.to_dict(),
+            outcome_available=outcome_avail,
         )
     except Exception as exc:
         logger.exception("PDF generation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    filename = f"ergo_ai_report_{lang}.pdf"
+    filename = f"optide_report_{scope.scope_id}_{lang}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -848,12 +930,78 @@ async def report(
     )
 
 
-# ---------------------------------------------------------------------------
-# Entry point — python main.py
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# POST /historical_baseline
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.post("/historical_baseline", tags=["analysis"])
+async def historical_baseline(request: HistoricalBaselineRequest) -> dict[str, Any]:
+    """
+    Accept-all baseline on a scope's bookings using actual outcome data.
+    Returns 422 if outcome data is unavailable.
+    """
+    _require_ready()
+    scope     = _require_scope(request.scope_id)
+    domain_id = scope.domain_config_id
+    cfg       = _require_domain(domain_id)
+
+    df = _scope_df(scope, domain_id)
+
+    if not _outcome_available(df, cfg):
+        raise HTTPException(
+            status_code=422,
+            detail="Outcome data not available for this scope (real-time data).",
+        )
+
+    snap    = scope.params_snapshot
+    penalty = request.cancellation_penalty \
+              if request.cancellation_penalty is not None \
+              else snap.get("cancellation_penalty", cfg.cancellation_penalty_default)
+
+    gross_rev = evaluate_revenue(df, cfg.revenue_formula)
+    y_true    = df[cfg.ml_target_column].values.astype(int)
+    n         = len(df)
+
+    realized = _realized_profit(np.ones(n, dtype=int), y_true, gross_rev, penalty)
+    cancellations = int(y_true.sum())
+
+    logger.info(
+        "[baseline scope=%s] n=%d  cancellations=%d  realized=%.0f",
+        scope.scope_id, n, cancellations, realized,
+    )
+
+    return {
+        "scope_id":                  scope.scope_id,
+        "bookings_accepted":         n,
+        "total_realized_profit":     round(realized, 2),
+        "total_gross_revenue":       round(float(gross_rev.sum()), 2),
+        "realized_cancellations":    cancellations,
+        "cancellation_penalty_used": penalty,
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# GET /report  (backward-compat alias — GET /report?scope_id=&lang=)
+# ────────────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/report",
+    tags=["reporting"],
+    responses={200: {"content": {"application/pdf": {}}}},
+)
+async def report_get(
+    scope_id: str = Query(...),
+    lang: str     = Query(default="en", pattern="^(en|it)$"),
+) -> Response:
+    """GET alias for /report (query-param version)."""
+    return await report(ReportRequest(scope_id=scope_id, lang=lang))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

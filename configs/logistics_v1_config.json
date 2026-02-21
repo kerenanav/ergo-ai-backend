@@ -1,0 +1,41 @@
+{
+  "domain_id": "logistics_v1",
+  "domain_name": "Logistics Route Acceptance",
+  "config_version": "1.0",
+  "decision_mode": "row_level",
+  "time_column": "shipment_date",
+  "time_builder": null,
+  "action_columns": ["accepted"],
+  "resource_columns": ["vehicle_type", "route_zone"],
+  "id_column": "shipment_id",
+  "uid_strategy": "hash",
+  "uid_key_columns": ["shipment_id", "shipment_date", "origin", "destination"],
+  "revenue_formula": "base_rate * weight_kg * distance_km",
+  "cost_formula": "fuel_cost + handling_fee",
+  "ml_target_column": "cancelled",
+  "ml_features": [
+    "origin", "destination", "vehicle_type", "route_zone",
+    "weight_kg", "distance_km", "lead_days",
+    "customer_tier", "base_rate"
+  ],
+  "historical_policy": "accept_all",
+  "historical_policy_column": null,
+  "constraints": [
+    {
+      "type": "C1",
+      "resource_key": ["vehicle_type", "route_zone"],
+      "capacity_value": 50,
+      "alpha": 1.0,
+      "time_indexed": true
+    },
+    {
+      "type": "C2",
+      "lower": 0,
+      "upper": 1
+    }
+  ],
+  "cancellation_penalty_default": 200.0,
+  "risk_enabled": false,
+  "lambda_risk_default": 0.0,
+  "dataset_path": "logistics_data.csv"
+}

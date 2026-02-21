@@ -1,23 +1,18 @@
 """
 decision_engine.py — Layer 2: MILP-based booking optimiser (HiGHS via scipy).
 
-Algorithm
-─────────
-1. Build financial quantities (BookingFinancials) from booking DataFrame +
-   P(cancel) predictions from Layer 1.
-2. Construct the objective vector c (negate EV for minimisation).
-3. Compile capacity constraints (C1 expected-occupancy, C2 hard ceiling).
-4. Solve the 0-1 MILP with scipy.optimize.milp, which internally calls HiGHS.
-5. If HiGHS fails or times-out, fall back to a deterministic greedy heuristic
-   (sort by descending EV, accept until capacity is filled).
-
-All random seeds are fixed; results are fully reproducible.
+V2 changes:
+  - OptimizationResult gains uids: list[str] and lambda_status: str
+  - optimize() accepts cfg: DomainConfig for revenue formula
+  - Revenue computed via evaluate_revenue(df, cfg.revenue_formula)
+  - lambda_status = "inactive" when cfg.risk_enabled = False (always in V1)
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -28,137 +23,77 @@ from objective_builder import BookingFinancials, build_objective
 
 logger = logging.getLogger(__name__)
 
-# HiGHS solver time limit (seconds)
 _SOLVER_TIME_LIMIT: float = 120.0
 
-
-# ---------------------------------------------------------------------------
-# Result container
-# ---------------------------------------------------------------------------
 
 @dataclass
 class OptimizationResult:
     """All outputs from a single optimisation run."""
 
     decisions: np.ndarray
-    """Binary array: 1 = accept, 0 = reject."""
-
+    uids: list[str]
     p_cancel: np.ndarray
-    """Cancellation probabilities passed to the solver."""
-
     expected_values: np.ndarray
-    """Per-booking expected profit EV_i (before the accept/reject decision)."""
-
     gross_revenues: np.ndarray
-    """Per-booking gross revenue if the guest shows up (adr × nights)."""
-
     total_expected_revenue: float
-    """Sum of EV_i for accepted bookings: Σ decisions_i · EV_i."""
-
     expected_occupancy: float
-    """Expected number of rooms occupied: Σ decisions_i · p_nocancel_i."""
-
     n_accepted: int
     n_rejected: int
     solver_status: str
+    lambda_status: str     # "inactive" (V1) or "active" (future V2)
 
-
-# ---------------------------------------------------------------------------
-# DecisionEngine
-# ---------------------------------------------------------------------------
 
 class DecisionEngine:
     """Wraps scipy.optimize.milp (HiGHS) for the booking-acceptance problem."""
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def optimize(
         self,
         df_bookings: pd.DataFrame,
         p_cancel: np.ndarray,
         params: OptimizationParams,
+        cfg: Any | None = None,          # DomainConfig
+        uids: list[str] | None = None,
     ) -> OptimizationResult:
-        """Optimise the accept/reject decisions for a batch of bookings.
-
-        Parameters
-        ----------
-        df_bookings:
-            DataFrame with at least ``adr`` and ``total_nights`` columns.
-        p_cancel:
-            Shape-(n,) array of cancellation probabilities from Layer 1.
-        params:
-            Capacity, penalty, and lambda hyper-parameters.
-
-        Returns
-        -------
-        OptimizationResult
-        """
         n = len(df_bookings)
         if n == 0:
             return self._empty_result()
 
-        print(f"PARAMETRI OTTIMIZZAZIONE: capacity={params.capacity}, cancellation_penalty={params.cancellation_penalty}, lambda_risk={params.lambda_risk}, n_bookings={n}", flush=True)
-
-        # ── Extract financial inputs ────────────────────────────────────
-        adr = df_bookings["adr"].fillna(0).values.astype(np.float64)
-
-        # total_nights may or may not be pre-computed in the DataFrame
-        if "total_nights" in df_bookings.columns:
-            nights = df_bookings["total_nights"].fillna(1).values.astype(np.float64)
-        elif "stays_in_week_nights" in df_bookings.columns:
-            nights = (
-                df_bookings["stays_in_weekend_nights"].fillna(0)
-                + df_bookings["stays_in_week_nights"].fillna(0)
-            ).values.astype(np.float64)
+        # ── Revenue from domain formula ─────────────────────────────────
+        if cfg is not None:
+            from domain_config import evaluate_revenue
+            gross_rev = evaluate_revenue(df_bookings, cfg.revenue_formula)
         else:
-            nights = np.ones(n, dtype=np.float64)
+            adr = df_bookings["adr"].fillna(0).values.astype(np.float64)
+            if "total_nights" in df_bookings.columns:
+                nights = df_bookings["total_nights"].fillna(1).values.astype(np.float64)
+            elif "stays_in_week_nights" in df_bookings.columns:
+                nights = (
+                    df_bookings["stays_in_weekend_nights"].fillna(0)
+                    + df_bookings["stays_in_week_nights"].fillna(0)
+                ).values.astype(np.float64)
+            else:
+                nights = np.ones(n, dtype=np.float64)
+            gross_rev = adr * np.maximum(nights, 1.0)
 
-        nights = np.maximum(nights, 1.0)
+        risk_enabled = (cfg.risk_enabled if cfg is not None else False)
+        lambda_status = "inactive" if not risk_enabled else "active"
 
         financials = BookingFinancials(
-            adr=adr,
-            total_nights=nights,
+            gross_revenue=gross_rev,
             p_cancel=p_cancel,
             cancellation_penalty=params.cancellation_penalty,
             lambda_risk=params.lambda_risk,
+            risk_enabled=risk_enabled,
         )
 
-        # ── Per-booking diagnostic log ─────────────────────────────────────
-        ev_pre  = financials.p_no_cancel * financials.gross_revenue - params.cancellation_penalty * financials.p_cancel
-        risk_v  = params.lambda_risk * financials.p_cancel * financials.p_no_cancel * financials.gross_revenue
-        ev_post = financials.expected_value
-        print(
-            f"{'#':>4}  {'gross_rev':>10}  {'p_cancel':>8}  "
-            f"{'EV_pre_risk':>12}  {'risk_term':>10}  {'EV_post_risk':>12}",
-            flush=True,
-        )
-        for i in range(n):
-            print(
-                f"{i:>4}  {financials.gross_revenue[i]:>10.2f}  {financials.p_cancel[i]:>8.4f}  "
-                f"{ev_pre[i]:>12.2f}  {risk_v[i]:>10.2f}  {ev_post[i]:>12.2f}",
-                flush=True,
-            )
-        n_pos = int((ev_post > 0).sum())
-        print(
-            f"[diag] bookings with EV>0: {n_pos}/{n}  "
-            f"lambda={params.lambda_risk}  penalty={params.cancellation_penalty}  capacity={params.capacity}",
-            flush=True,
-        )
-        # ───────────────────────────────────────────────────────────────────
-
-        c           = build_objective(financials)          # shape (n,) to minimise
+        domain_constraints = (cfg.constraints if cfg is not None else None)
+        c           = build_objective(financials)
         p_no_cancel = financials.p_no_cancel
-        constraints = compile_constraints(p_no_cancel, params)
+        constraints = compile_constraints(p_no_cancel, params, domain_constraints)
 
-        # Variable bounds: 0 ≤ x_i ≤ 1
-        bounds = Bounds(lb=np.zeros(n), ub=np.ones(n))
-
-        # All variables are binary (integer in [0, 1])
+        bounds      = Bounds(lb=np.zeros(n), ub=np.ones(n))
         integrality = np.ones(n, dtype=int)
 
-        # ── Solve with HiGHS ───────────────────────────────────────────
         result = milp(
             c,
             constraints=constraints,
@@ -170,83 +105,58 @@ class DecisionEngine:
         if result.success and result.x is not None:
             decisions     = np.round(result.x).astype(int)
             solver_status = "optimal"
-            logger.info(
-                "HiGHS optimal — accepted %d/%d  obj=%.2f",
-                decisions.sum(), n, -result.fun,
-            )
+            logger.info("HiGHS optimal — accepted %d/%d  obj=%.2f",
+                        decisions.sum(), n, -result.fun)
         else:
-            logger.warning(
-                "HiGHS solver returned status '%s'. Falling back to greedy.",
-                result.message,
-            )
+            logger.warning("HiGHS '%s'. Falling back to greedy.", result.message)
             decisions     = self._greedy_fallback(financials, params)
             solver_status = "greedy_fallback"
 
-        # ── Per-booking decision log ───────────────────────────────────────
-        for i in range(n):
-            print(
-                f"  booking {i:>3}  EV={ev_post[i]:>8.2f}  "
-                f"decision={'ACCEPT' if decisions[i] == 1 else 'reject'}",
-                flush=True,
-            )
-        # ──────────────────────────────────────────────────────────────────
+        ev       = financials.expected_value
+        total_ev = float(np.dot(decisions, ev))
+        exp_occ  = float(np.dot(decisions, p_no_cancel))
 
-        # ── Build result ───────────────────────────────────────────────
-        ev              = financials.expected_value
-        total_rev       = float(np.dot(decisions, ev))
-        exp_occ         = float(np.dot(decisions, p_no_cancel))
+        uid_list = uids if uids is not None else [str(i) for i in range(n)]
 
         return OptimizationResult(
             decisions=decisions,
+            uids=uid_list,
             p_cancel=p_cancel,
             expected_values=ev,
-            gross_revenues=financials.gross_revenue,
-            total_expected_revenue=total_rev,
+            gross_revenues=gross_rev,
+            total_expected_revenue=total_ev,
             expected_occupancy=exp_occ,
             n_accepted=int(decisions.sum()),
             n_rejected=int(n - decisions.sum()),
             solver_status=solver_status,
+            lambda_status=lambda_status,
         )
-
-    # ------------------------------------------------------------------
-    # Greedy fallback
-    # ------------------------------------------------------------------
 
     def _greedy_fallback(
         self,
         financials: BookingFinancials,
         params: OptimizationParams,
     ) -> np.ndarray:
-        """Accept bookings in descending EV order until capacity count is reached."""
         ev        = financials.expected_value
         cap_limit = int(round(params.capacity))
-
-        order     = np.argsort(-ev)   # descending expected value
+        order     = np.argsort(-ev)
         decisions = np.zeros(len(ev), dtype=int)
         count     = 0
-
         for i in order:
-            if ev[i] <= 0.0:          # no-value or negative-value booking
+            if ev[i] <= 0.0:
                 break
             if count < cap_limit:
                 decisions[i] = 1
-                count        += 1
-
-        logger.info(
-            "Greedy fallback — accepted %d/%d  capacity=%d",
-            decisions.sum(), len(ev), cap_limit,
-        )
+                count += 1
+        logger.info("Greedy fallback — accepted %d/%d", decisions.sum(), len(ev))
         return decisions
-
-    # ------------------------------------------------------------------
-    # Empty result for zero-booking input
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _empty_result() -> OptimizationResult:
         empty = np.array([], dtype=np.float64)
         return OptimizationResult(
             decisions=np.array([], dtype=int),
+            uids=[],
             p_cancel=empty,
             expected_values=empty,
             gross_revenues=empty,
@@ -255,4 +165,5 @@ class DecisionEngine:
             n_accepted=0,
             n_rejected=0,
             solver_status="empty",
+            lambda_status="inactive",
         )
