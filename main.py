@@ -404,9 +404,15 @@ class OptimizeRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    scope_id:          str
-    n_splits:          int = Field(default=5,   ge=2, le=10)
-    n_samples_per_fold:int = Field(default=100, ge=10, le=1000)
+    scope_id:           Optional[str]  = None
+    start_date:         Optional[str]  = None
+    end_date:           Optional[str]  = None
+    cancellation_penalty: float        = 50.0
+    capacity:           float          = 100.0
+    lambda_risk:        float          = 0.0
+    n_samples:          int            = Field(default=100, ge=10, le=10_000)
+    n_splits:           int            = Field(default=5,   ge=2,  le=10)
+    n_samples_per_fold: int            = Field(default=100, ge=10, le=1000)
 
 
 class SensitivityRequest(BaseModel):
@@ -1035,25 +1041,67 @@ async def optimize(request: OptimizeRequest) -> dict[str, Any]:
 async def backtest(request: BacktestRequest) -> dict[str, Any]:
     """
     Rolling walk-forward backtest: AI strategy vs accept-all baseline.
-    Returns 409 if the scope is not locked.
+
+    With scope_id: scope must be locked; uses scope UIDs and snapshot params.
+    Without scope_id: samples n_samples rows from hotel_v1 (default domain),
+      optionally filtered by start_date / end_date.
     Returns 422 if no ground-truth outcomes are available.
     """
     _require_ready()
-    scope = _require_scope(request.scope_id)
-    _require_locked(scope)
 
-    domain_id = scope.domain_config_id
-    cfg       = _require_domain(domain_id)
-    predictor, engine = _require_predictor(domain_id)
+    if request.scope_id is not None:
+        # ── Scope-based path ──────────────────────────────────────────────────
+        scope     = _require_scope(request.scope_id)
+        _require_locked(scope)
+        domain_id = scope.domain_config_id
+        cfg       = _require_domain(domain_id)
+        predictor, engine = _require_predictor(domain_id)
 
-    df_full = _state["datasets"].get(domain_id)
-    if df_full is None:
-        raise HTTPException(status_code=503, detail="Dataset not loaded.")
+        df_full = _state["datasets"].get(domain_id)
+        if df_full is None:
+            raise HTTPException(status_code=503, detail="Dataset not loaded.")
 
-    outcome_avail = _outcome_available(
-        df_full[df_full["_uid"].isin(scope.selected_uids)] if "_uid" in df_full.columns else df_full,
-        cfg,
-    )
+        df_scope = df_full[df_full["_uid"].isin(scope.selected_uids)] \
+                   if "_uid" in df_full.columns else df_full
+
+        outcome_avail = _outcome_available(df_scope, cfg)
+        snap   = scope.params_snapshot
+        params = OptimizationParams(
+            capacity=snap.get("capacity", 100.0),
+            cancellation_penalty=snap.get("cancellation_penalty", cfg.cancellation_penalty_default),
+            lambda_risk=snap.get("lambda_risk", cfg.lambda_risk_default),
+        )
+        bt_df        = df_full   # backtester filters internally by scope
+        scope_arg    = scope
+        scope_id_out = scope.scope_id
+
+    else:
+        # ── Scopeless path (default domain = hotel_v1) ────────────────────────
+        domain_id = "hotel_v1"
+        cfg       = _require_domain(domain_id)
+        predictor, engine = _require_predictor(domain_id)
+
+        df_full = _state["datasets"].get(domain_id)
+        if df_full is None:
+            raise HTTPException(status_code=503, detail="Dataset not loaded.")
+
+        df_pool = _apply_date_filter(df_full, request.start_date, request.end_date)
+        if len(df_pool) == 0:
+            raise HTTPException(status_code=422, detail="No rows remain after date filter.")
+        n = min(request.n_samples, len(df_pool))
+        rng = np.random.default_rng(RANDOM_SEED)
+        idx = rng.choice(len(df_pool), size=n, replace=False)
+        bt_df = df_pool.iloc[idx].copy().reset_index(drop=True)
+
+        outcome_avail = _outcome_available(bt_df, cfg)
+        params = OptimizationParams(
+            capacity=request.capacity,
+            cancellation_penalty=request.cancellation_penalty,
+            lambda_risk=request.lambda_risk,
+        )
+        scope_arg    = None
+        scope_id_out = None
+
     if not outcome_avail:
         raise HTTPException(
             status_code=422,
@@ -1066,21 +1114,14 @@ async def backtest(request: BacktestRequest) -> dict[str, Any]:
             },
         )
 
-    snap    = scope.params_snapshot
-    params  = OptimizationParams(
-        capacity=snap.get("capacity", 100.0),
-        cancellation_penalty=snap.get("cancellation_penalty", cfg.cancellation_penalty_default),
-        lambda_risk=snap.get("lambda_risk", cfg.lambda_risk_default),
-    )
     model_metrics = _state["model_metrics"].get(domain_id, {})
-
     bt = Backtester(predictor, engine)
     try:
         summary = bt.run(
-            df_full,
+            bt_df,
             params,
             cfg=cfg,
-            scope=scope,
+            scope=scope_arg,
             outcome_available=True,
             n_splits=request.n_splits,
             n_samples_per_fold=request.n_samples_per_fold,
@@ -1094,11 +1135,12 @@ async def backtest(request: BacktestRequest) -> dict[str, Any]:
         logger.exception("Backtest failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    sm: ScopeManager = _state["scope_manager"]
-    sm.mark_backtest_completed(scope.scope_id)
-
     result_dict = summary.to_dict()
-    _state["backtests"][scope.scope_id] = result_dict
+
+    if scope_id_out is not None:
+        sm: ScopeManager = _state["scope_manager"]
+        sm.mark_backtest_completed(scope_id_out)
+        _state["backtests"][scope_id_out] = result_dict
 
     return result_dict
 
