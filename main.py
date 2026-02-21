@@ -348,13 +348,15 @@ class CloneScopeRequest(BaseModel):
 class OptimizeRequest(BaseModel):
     # Format A (scope-based, recommended):
     scope_id:             Optional[str]   = None
-    # Format B (legacy, scopeless — for quick tests without a scope):
+    # Format B/C (scopeless): domain_id optional; defaults to "hotel_v1" if omitted
     domain_id:            Optional[str]   = None
     n_samples:            int             = Field(default=100, ge=1, le=10_000)
-    # Shared params (override scope snapshot in Format A; used directly in Format B):
-    cancellation_penalty: Optional[float] = None
-    capacity:             Optional[float] = None
-    lambda_risk:          Optional[float] = None
+    # Shared params — have defaults so the frontend can omit them
+    cancellation_penalty: float           = 50.0
+    capacity:             float           = 100.0
+    lambda_risk:          float           = 0.0
+    # Legacy envelope: {"params": {"cancellation_penalty": ..., "capacity": ...}}
+    params:               Optional[dict]  = None
 
 
 class BacktestRequest(BaseModel):
@@ -761,15 +763,32 @@ async def optimize(request: OptimizeRequest) -> dict[str, Any]:
     """
     Run MILP optimisation.
 
-    Format A (scope-based, recommended):
+    Format A (scope-based):
         {"scope_id": "...", "cancellation_penalty": 50, "capacity": 100}
         → Uses scope's selected UIDs; locks scope on success.
 
-    Format B (legacy / scopeless):
+    Format B (explicit domain, scopeless):
         {"domain_id": "hotel_v1", "n_samples": 100, "cancellation_penalty": 50, "capacity": 100}
-        → Samples n_samples rows from full dataset; no scope created/locked.
+        → Samples n_samples rows; no scope created/locked.
+
+    Format C (direct params, no scope_id, no domain_id):
+        {"cancellation_penalty": 100, "capacity": 100, "lambda_risk": 0, "n_samples": 100}
+        → Defaults to domain_id="hotel_v1"; same as Format B.
     """
     _require_ready()
+
+    # ── Unwrap legacy params envelope if present ──────────────────────────────
+    # Allows {"params": {"cancellation_penalty": X, "capacity": Y, ...}}
+    if request.params:
+        p = request.params
+        if "cancellation_penalty" in p:
+            request.cancellation_penalty = float(p["cancellation_penalty"])
+        if "capacity" in p:
+            request.capacity = float(p["capacity"])
+        if "lambda_risk" in p:
+            request.lambda_risk = float(p["lambda_risk"])
+        if "n_samples" in p:
+            request.n_samples = int(p["n_samples"])
 
     # ── Determine mode ────────────────────────────────────────────────────────
     use_scope = request.scope_id is not None
@@ -782,31 +801,26 @@ async def optimize(request: OptimizeRequest) -> dict[str, Any]:
         predictor, engine = _require_predictor(domain_id)
 
         snap        = scope.params_snapshot
-        penalty     = request.cancellation_penalty if request.cancellation_penalty is not None \
+        penalty     = request.cancellation_penalty if request.cancellation_penalty != 50.0 \
                       else snap.get("cancellation_penalty", cfg.cancellation_penalty_default)
-        capacity    = request.capacity if request.capacity is not None \
+        capacity    = request.capacity if request.capacity != 100.0 \
                       else snap.get("capacity", 100.0)
-        lambda_risk = request.lambda_risk if request.lambda_risk is not None \
+        lambda_risk = request.lambda_risk if request.lambda_risk != 0.0 \
                       else snap.get("lambda_risk", cfg.lambda_risk_default)
 
         df = _scope_df(scope, domain_id)
 
     else:
-        # ── Format B: legacy / scopeless ──────────────────────────────────────
-        if not request.domain_id:
-            raise HTTPException(
-                status_code=422,
-                detail="Provide either scope_id (Format A) or domain_id (Format B).",
-            )
-        domain_id = request.domain_id
+        # ── Format B / C: scopeless ───────────────────────────────────────────
+        # Format C: no domain_id → default to "hotel_v1"
+        domain_id = request.domain_id or "hotel_v1"
         cfg       = _require_domain(domain_id)
         predictor, engine = _require_predictor(domain_id)
         scope     = None
 
-        penalty     = request.cancellation_penalty if request.cancellation_penalty is not None \
-                      else cfg.cancellation_penalty_default
-        capacity    = request.capacity    if request.capacity    is not None else 100.0
-        lambda_risk = request.lambda_risk if request.lambda_risk is not None else cfg.lambda_risk_default
+        penalty     = request.cancellation_penalty
+        capacity    = request.capacity
+        lambda_risk = request.lambda_risk
 
         df_full = _state["datasets"].get(domain_id)
         if df_full is None:
