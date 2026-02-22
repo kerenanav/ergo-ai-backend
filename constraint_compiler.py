@@ -107,8 +107,11 @@ def compile_constraints(
             c_type = _classify(rule)
 
             if c_type == "C1":
-                # Step C: extract capacity
-                cap = float(rule.get("capacity_value", params.capacity))
+                # Step C: runtime params.capacity is the binding limit.
+                # config capacity_value is a reference default only — the
+                # request parameter always overrides it so that callers can
+                # send capacity=50 and get at most 50 accepted bookings.
+                cap = params.capacity
                 resource_key = rule.get("resource_key", [])
                 if resource_key:
                     logger.debug(
